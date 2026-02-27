@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: adhdbot
+      POSTGRES_USER: adhdbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment:
+      APP_MODE: api
+      DATABASE_URL: postgresql+psycopg2://adhdbot:${POSTGRES_PASSWORD:-change-me}@db:5432/adhdbot
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER}
+      USER_PHONE: ${USER_PHONE:-+15184690834}
+      USER_TIMEZONE: ${USER_TIMEZONE:-America/New_York}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    environment:
+      APP_MODE: scheduler
+      DATABASE_URL: postgresql+psycopg2://adhdbot:${POSTGRES_PASSWORD:-change-me}@db:5432/adhdbot
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER}
+      USER_PHONE: ${USER_PHONE:-+15184690834}
+      USER_TIMEZONE: ${USER_TIMEZONE:-America/New_York}
+      TICK_SECONDS: ${TICK_SECONDS:-60}
+      GMAIL_ADDRESS: ${GMAIL_ADDRESS:-isaacmray1984@gmail.com}
+      GMAIL_APP_PASSWORD: ${GMAIL_APP_PASSWORD}
+      GMAIL_SEARCH_FROM: ${GMAIL_SEARCH_FROM:-kathrynrose6@gmail.com}
+      GMAIL_SEARCH_DAYS: ${GMAIL_SEARCH_DAYS:-30}
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  ui:
+    build: .
+    environment:
+      APP_MODE: ui
+      DATABASE_URL: postgresql+psycopg2://adhdbot:${POSTGRES_PASSWORD:-change-me}@db:5432/adhdbot
+      USER_TIMEZONE: ${USER_TIMEZONE:-America/New_York}
+    ports:
+      - "8081:8081"
+    depends_on:
+      - db
+    restart: unless-stopped
+
+volumes:
+  pgdata:
