@@ -42,6 +42,10 @@ services:
       GMAIL_APP_PASSWORD: ${GMAIL_APP_PASSWORD}
       GMAIL_SEARCH_FROM: ${GMAIL_SEARCH_FROM:-kathrynrose6@gmail.com}
       GMAIL_SEARCH_DAYS: ${GMAIL_SEARCH_DAYS:-30}
+      BASEMENT_LIGHT_ON: ${BASEMENT_LIGHT_ON}
+      BASEMENT_LIGHT_OFF: ${BASEMENT_LIGHT_OFF}
+      WEATHERAPI_KEY: ${WEATHERAPI_KEY}
+      BRIEFING_TIME: ${BRIEFING_TIME:-07:30}
     depends_on:
       - db
     restart: unless-stopped

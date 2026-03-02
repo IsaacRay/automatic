@@ -1,0 +1,15 @@
+[Unit]
+Description=ADHD Bot (docker compose)
+Requires=snap.docker.dockerd.service
+After=snap.docker.dockerd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/iray/automatic
+ExecStart=/snap/bin/docker compose up -d --build
+ExecStop=/snap/bin/docker compose down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

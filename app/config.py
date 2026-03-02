@@ -48,3 +48,19 @@ GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "isaacmray1984@gmail.com")
 GMAIL_APP_PASSWORD = _env_or_file("GMAIL_APP_PASSWORD", "/home/iray/app_cred.txt")
 GMAIL_SEARCH_FROM = os.environ.get("GMAIL_SEARCH_FROM", "kathrynrose6@gmail.com")
 GMAIL_SEARCH_DAYS = int(os.environ.get("GMAIL_SEARCH_DAYS", "30"))
+
+# Morning briefing
+WEATHERAPI_KEY = _env_or_file("WEATHERAPI_KEY", "/home/iray/weatherapi_key.txt")
+BRIEFING_TIME = os.environ.get("BRIEFING_TIME", "07:30")
+
+# Exercise motivation
+EXERCISE_MORNING_TIME = os.environ.get("EXERCISE_MORNING_TIME", "10:00")
+EXERCISE_EVENING_TIME = os.environ.get("EXERCISE_EVENING_TIME", "17:00")
+GOOGLE_CALENDAR_ICS = os.environ.get(
+    "GOOGLE_CALENDAR_ICS",
+    "https://calendar.google.com/calendar/ical/isaacmray1984%40gmail.com/private-6c66bacfc8241c9fa97fe2985e7b2ba7/basic.ics",
+)
+
+# Basement light webhooks (IFTTT)
+BASEMENT_LIGHT_ON = os.environ.get("BASEMENT_LIGHT_ON", "")
+BASEMENT_LIGHT_OFF = os.environ.get("BASEMENT_LIGHT_OFF", "")

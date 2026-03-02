@@ -1,8 +1,8 @@
-"""Database models — all 4 tables."""
+"""Database models — all 5 tables."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, Index
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, Index
 from app.database import Base
 
 
@@ -52,6 +52,65 @@ class ActionItem(Base):
     snooze_until = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class PendingConfirmation(Base):
+    __tablename__ = "pending_confirmations"
+
+    id = Column(Integer, primary_key=True)
+    user_phone = Column(String(20), nullable=False, index=True)
+    action_type = Column(String(30), nullable=False)  # e.g. "reschedule"
+    payload = Column(Text, nullable=False)  # JSON text
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    expires_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+
+
+class NagSchedule(Base):
+    __tablename__ = "nag_schedules"
+
+    id = Column(Integer, primary_key=True)
+    user_phone = Column(String(20), nullable=False, index=True)
+    label = Column(Text, nullable=False)
+    message = Column(Text, nullable=False)
+    cron_expression = Column(String(100), nullable=False)
+    interval_minutes = Column(Integer, nullable=False)
+    max_duration_minutes = Column(Integer, nullable=True)
+    timezone = Column(String(50), nullable=False, default="America/New_York")
+    next_nag_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    nag_until = Column(DateTime(timezone=True), nullable=True)
+    active_since = Column(DateTime(timezone=True), nullable=True)
+    nag_count = Column(Integer, nullable=False, default=0)
+    repeating = Column(Boolean, nullable=False, default=False)
+    anchor_to_completion = Column(Boolean, nullable=False, default=False)
+    cycle_months = Column(Integer, nullable=True)
+    cycle_days = Column(Integer, nullable=True)
+    recurrence_description = Column(String(200), nullable=True)
+    status = Column(String(20), nullable=False, default="active")
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class AppState(Base):
+    __tablename__ = "app_state"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class ExerciseLog(Base):
+    __tablename__ = "exercise_log"
+
+    id = Column(Integer, primary_key=True)
+    user_phone = Column(String(20), nullable=False, index=True)
+    activity = Column(String(50), nullable=False)      # "run", "bike", "indoor bike"
+    duration_minutes = Column(Integer, nullable=True)
+    distance_miles = Column(Float, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 class SmsLog(Base):

@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.database import engine, Base, SessionLocal
-from app.models import Reminder, RecurringSchedule, ActionItem
+from app.models import Reminder, RecurringSchedule, ActionItem, NagSchedule, ExerciseLog
 from app.config import USER_TIMEZONE
 
 app = FastAPI(title="ADHD Bot UI")
@@ -50,7 +50,7 @@ def _render_page(body: str) -> HTMLResponse:
 </head>
 <body>
 <h1>ADHD Bot</h1>
-<nav><a href="/">Reminders</a> <a href="/recurring">Recurring</a> <a href="/actions">Action Items</a></nav>
+<nav><a href="/">Reminders</a> <a href="/recurring">Recurring</a> <a href="/actions">Action Items</a> <a href="/nags">Nags</a> <a href="/exercise">Exercise</a></nav>
 {body}
 </body>
 </html>"""
@@ -136,7 +136,9 @@ def recurring_page():
 def actions_page():
     db = SessionLocal()
     try:
-        rows = db.query(ActionItem).order_by(ActionItem.created_at.desc()).all()
+        rows = db.query(ActionItem).filter(
+            ActionItem.status != "archived"
+        ).order_by(ActionItem.created_at.desc()).all()
         if not rows:
             return _render_page("<h2>Action Items</h2><p class='empty'>None.</p>")
 
@@ -196,7 +198,9 @@ def delete_recurring(id: int):
 def delete_action(id: int):
     db = SessionLocal()
     try:
-        db.query(ActionItem).filter(ActionItem.id == id).delete()
+        item = db.query(ActionItem).filter(ActionItem.id == id).first()
+        if item:
+            item.status = "archived"
         db.commit()
     finally:
         db.close()
@@ -229,11 +233,146 @@ def delete_completed_recurring():
 def delete_completed_actions():
     db = SessionLocal()
     try:
-        db.query(ActionItem).filter(ActionItem.status == "done").delete(synchronize_session=False)
+        db.query(ActionItem).filter(ActionItem.status == "done").update(
+            {"status": "archived"}, synchronize_session=False
+        )
         db.commit()
     finally:
         db.close()
     return RedirectResponse("/actions", status_code=303)
+
+
+@app.get("/nags", response_class=HTMLResponse)
+def nags_page():
+    db = SessionLocal()
+    try:
+        rows = db.query(NagSchedule).order_by(NagSchedule.next_nag_at.desc()).all()
+        if not rows:
+            return _render_page("<h2>Nag Schedules</h2><p class='empty'>None.</p>")
+
+        trs = ""
+        for r in rows:
+            active = "ACTIVE" if r.active_since else "-"
+            dur = f"{r.max_duration_minutes}m" if r.max_duration_minutes else "∞"
+            anchor = ""
+            if r.anchor_to_completion:
+                period = f"{r.cycle_months}mo" if r.cycle_months else f"{r.cycle_days}d"
+                anchor = f"&#x2693; {period}"
+            repeating = r.recurrence_description if r.recurrence_description else ("Yes" if r.repeating else "No")
+            trs += f"""<tr>
+              <td>{r.id}</td>
+              <td>{r.label}</td>
+              <td>{r.cron_expression}</td>
+              <td>{r.interval_minutes}m</td>
+              <td>{dur}</td>
+              <td>{repeating}</td>
+              <td>{_fmt(r.next_nag_at)}</td>
+              <td class="status-{r.status}">{r.status}</td>
+              <td>{active}</td>
+              <td>{anchor}</td>
+              <td><form method="post" action="/delete/nag/{r.id}" style="margin:0">
+                <button class="btn" onclick="return confirm('Delete?')">del</button>
+              </form></td>
+            </tr>"""
+
+        cleanup_btn = ""
+        done_count = sum(1 for r in rows if r.status == "deleted")
+        if done_count:
+            cleanup_btn = f"""<form method="post" action="/delete/nags/completed" style="margin:0;display:inline">
+              <button class="btn-cleanup" onclick="return confirm('Delete {done_count} cancelled nag schedules?')">Delete all cancelled ({done_count})</button>
+            </form>"""
+
+        table = f"""<h2>Nag Schedules ({len(rows)})</h2>
+        {cleanup_btn}
+        <table><tr><th>ID</th><th>Label</th><th>Cron</th><th>Interval</th><th>Duration</th><th>Repeating</th><th>Next Nag</th><th>Status</th><th>Active</th><th>Anchor</th><th></th></tr>
+        {trs}</table>"""
+        return _render_page(table)
+    finally:
+        db.close()
+
+
+@app.post("/delete/nag/{id}")
+def delete_nag(id: int):
+    db = SessionLocal()
+    try:
+        db.query(NagSchedule).filter(NagSchedule.id == id).delete()
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/nags", status_code=303)
+
+
+@app.get("/exercise", response_class=HTMLResponse)
+def exercise_page():
+    db = SessionLocal()
+    try:
+        rows = db.query(ExerciseLog).order_by(ExerciseLog.created_at.desc()).all()
+        if not rows:
+            return _render_page("<h2>Exercise Log</h2><p class='empty'>No activities logged.</p>")
+
+        trs = ""
+        for r in rows:
+            dist = f"{r.distance_miles} mi" if r.distance_miles else "-"
+            dur = f"{r.duration_minutes} min" if r.duration_minutes else "-"
+            notes = (r.notes[:60] + "...") if r.notes and len(r.notes) > 60 else (r.notes or "-")
+            trs += f"""<tr>
+              <td>{r.id}</td>
+              <td>{_fmt(r.created_at)}</td>
+              <td>{r.activity}</td>
+              <td>{dist}</td>
+              <td>{dur}</td>
+              <td>{notes}</td>
+              <td><form method="post" action="/delete/exercise/{r.id}" style="margin:0">
+                <button class="btn" onclick="return confirm('Delete?')">del</button>
+              </form></td>
+            </tr>"""
+
+        cleanup_btn = ""
+        if len(rows) > 1:
+            cleanup_btn = f"""<form method="post" action="/delete/exercise/all" style="margin:0;display:inline">
+              <button class="btn-cleanup" onclick="return confirm('Delete all {len(rows)} exercise log entries?')">Delete all ({len(rows)})</button>
+            </form>"""
+
+        table = f"""<h2>Exercise Log ({len(rows)})</h2>
+        {cleanup_btn}
+        <table><tr><th>ID</th><th>Date</th><th>Activity</th><th>Distance</th><th>Duration</th><th>Notes</th><th></th></tr>
+        {trs}</table>"""
+        return _render_page(table)
+    finally:
+        db.close()
+
+
+@app.post("/delete/exercise/{id}")
+def delete_exercise(id: int):
+    db = SessionLocal()
+    try:
+        db.query(ExerciseLog).filter(ExerciseLog.id == id).delete()
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/exercise", status_code=303)
+
+
+@app.post("/delete/exercise/all")
+def delete_all_exercise():
+    db = SessionLocal()
+    try:
+        db.query(ExerciseLog).delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/exercise", status_code=303)
+
+
+@app.post("/delete/nags/completed")
+def delete_completed_nags():
+    db = SessionLocal()
+    try:
+        db.query(NagSchedule).filter(NagSchedule.status == "deleted").delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/nags", status_code=303)
 
 
 if __name__ == "__main__":

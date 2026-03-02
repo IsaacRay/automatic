@@ -1,13 +1,16 @@
 """FastAPI webhook for incoming Twilio SMS."""
 
+import json
 import logging
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, Form, Response
 
 from app.database import engine, Base, SessionLocal
-from app.models import SmsLog
+from app.models import SmsLog, PendingConfirmation
 from app.config import USER_PHONE
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent
+from app.intent_router import handle_intent, execute_reschedule, execute_cancel, execute_acknowledge
 from app.twilio_client import send_sms
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -53,9 +56,63 @@ async def incoming_sms(
         ))
         db.commit()
 
+        # Check for pending confirmation before parsing intent
+        now = datetime.now(timezone.utc)
+        pending = db.query(PendingConfirmation).filter(
+            PendingConfirmation.user_phone == From,
+            PendingConfirmation.expires_at > now,
+        ).order_by(PendingConfirmation.created_at.desc()).first()
+
+        if pending:
+            stripped = Body.strip().lower()
+            # Extract payload BEFORE deleting to avoid stale-object issues
+            payload = json.loads(pending.payload)
+            action_type = pending.action_type
+            db.delete(pending)
+            db.commit()
+
+            if stripped.startswith("y"):
+                # User confirmed — execute the action
+                if action_type == "reschedule":
+                    reply = execute_reschedule(db, payload)
+                elif action_type == "cancel":
+                    reply = execute_cancel(db, payload)
+                elif action_type == "acknowledge":
+                    reply = execute_acknowledge(db, payload)
+                else:
+                    reply = "Unknown confirmation type."
+                log.info("Confirmation accepted: %s", action_type)
+            else:
+                # User declined — let them know and invite retry
+                log.info("Confirmation declined for: %s", action_type)
+                label = payload.get("label") or payload.get("description", "that")
+                reply = f"OK, didn't {action_type} \"{label}\". Try again with more detail or text LIST to see your items."
+
+            # Send reply
+            result = send_sms(USER_PHONE, reply)
+            sid = result.get("sid", "")
+            db.add(SmsLog(
+                direction="outbound",
+                phone=USER_PHONE,
+                body=reply,
+                twilio_sid=sid,
+            ))
+            db.commit()
+
+            return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+        # Also clean up any expired confirmations
+        db.query(PendingConfirmation).filter(
+            PendingConfirmation.expires_at <= now,
+        ).delete()
+        db.commit()
+
         # Parse intent via OpenAI
         parsed = parse_user_sms(Body)
         log.info("Parsed intent: %s", parsed.get("intent"))
+
+        # Inject raw message body so handlers always have the original text
+        parsed.setdefault("data", {})["_raw_message"] = Body
 
         # Handle intent
         reply = handle_intent(db, parsed)
