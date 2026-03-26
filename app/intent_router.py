@@ -11,11 +11,13 @@ from app.config import USER_PHONE, USER_TIMEZONE
 
 
 def _parse_dt(s: str) -> datetime:
-    """Parse an ISO 8601 datetime string, ensuring it's timezone-aware UTC."""
+    """Parse an ISO 8601 datetime string, treating naive strings as local time."""
+    from zoneinfo import ZoneInfo
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+        local_tz = ZoneInfo(USER_TIMEZONE)
+        dt = dt.replace(tzinfo=local_tz)
+    return dt.astimezone(timezone.utc)
 
 
 def _now_local():
@@ -95,6 +97,45 @@ def _backoff_delta(remind_count: int) -> timedelta:
         return timedelta(hours=24)
     else:
         return timedelta(hours=48)
+
+
+_ACK_STOP_WORDS = frozenset({
+    "done", "finished", "completed", "got", "handled", "did", "do",
+    "with", "the", "my", "a", "an", "is", "it", "i", "for", "to",
+})
+
+_CANCEL_STOP_WORDS = frozenset({
+    "cancel", "delete", "remove", "nvm", "nevermind", "forget", "stop",
+    "kill", "drop", "the", "my", "a", "an", "is", "it", "i", "for", "to",
+    "get", "rid", "of", "that", "about",
+})
+
+
+def _keyword_prefilter(search_text: str, items: list[dict], stop_words: frozenset) -> dict | None:
+    """Match items by keyword overlap in label/message before resorting to GPT.
+
+    Returns the best item if one clearly wins, otherwise None (fall back to GPT).
+    """
+    words = [w.lower() for w in search_text.split() if w.lower() not in stop_words and len(w) > 1]
+    if not words:
+        return None
+
+    scores = []
+    for item in items:
+        searchable = f"{item.get('label', '')} {item.get('message', '')}".lower()
+        hits = sum(1 for w in words if w in searchable)
+        scores.append((hits, item))
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+
+    if scores[0][0] == 0:
+        return None  # no keyword hits at all
+
+    # Clear winner: top match has strictly more hits than runner-up
+    if len(scores) == 1 or scores[0][0] > scores[1][0]:
+        return scores[0][1]
+
+    return None  # ambiguous — let GPT decide
 
 
 def handle_intent(db: Session, parsed: dict) -> str:
@@ -467,6 +508,48 @@ def execute_acknowledge(db: Session, payload: dict) -> str:
     return "Unknown item type."
 
 
+def execute_acknowledge_all(db: Session, payload: dict) -> str:
+    """Execute a confirmed acknowledge-all action. Called after user replies YES."""
+    import logging
+    log = logging.getLogger(__name__)
+
+    now = datetime.now(timezone.utc)
+
+    active_nags = db.query(NagSchedule).filter(
+        NagSchedule.user_phone == USER_PHONE,
+        NagSchedule.status == "active",
+        NagSchedule.active_since.isnot(None),
+    ).all()
+    for nag in active_nags:
+        if nag.repeating:
+            nag.active_since = None
+            nag.nag_until = None
+            nag.nag_count = 0
+            nag.next_nag_at = _next_nag_cycle(nag, now)
+        else:
+            nag.status = "deleted"
+
+    reminders = db.query(Reminder).filter(
+        Reminder.user_phone == USER_PHONE,
+        Reminder.status.in_(["pending", "sent"]),
+    ).all()
+    for r in reminders:
+        r.status = "dismissed"
+
+    items = db.query(ActionItem).filter(
+        ActionItem.user_phone == USER_PHONE,
+        ActionItem.status == "pending",
+    ).all()
+    for item in items:
+        item.status = "done"
+        item.completed_at = now
+
+    db.commit()
+    total = len(active_nags) + len(reminders) + len(items)
+    log.info("Acknowledged all: %d nags, %d reminders, %d actions", len(active_nags), len(reminders), len(items))
+    return f"Cleared all! Marked {total} items as done/dismissed."
+
+
 def _handle_create_recurring(db: Session, data: dict) -> str:
     label = data.get("label", "Recurring message")
     cron_expr = data.get("cron_expression", "")
@@ -511,8 +594,9 @@ def _handle_create_nag(db: Session, data: dict) -> str:
     if not cron_expr:
         cron_expr = "0 12 * * *"
 
-    # Auto-default max_duration_minutes for repeating nags to prevent infinite nagging
-    if repeating and max_dur is None:
+    # Auto-default max_duration_minutes for repeating nags to prevent infinite nagging.
+    # Exception: completion-anchored nags should nag indefinitely until acknowledged.
+    if repeating and max_dur is None and not anchor:
         cron_dow = cron_expr.split()[4] if len(cron_expr.split()) >= 5 else "*"
         if cycle_months or "monthly" in (recurrence_desc or "").lower():
             max_dur = 2880   # 48 hours for monthly
@@ -572,41 +656,41 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
     now = datetime.now(timezone.utc)
 
     if ack_all:
-        # End all active nag cycles
+        # Count how many items would be cleared
         active_nags = db.query(NagSchedule).filter(
             NagSchedule.user_phone == USER_PHONE,
             NagSchedule.status == "active",
             NagSchedule.active_since.isnot(None),
         ).all()
-        for nag in active_nags:
-            if nag.repeating:
-                nag.active_since = None
-                nag.nag_until = None
-                nag.nag_count = 0
-                nag.next_nag_at = _next_nag_cycle(nag, now)
-            else:
-                nag.status = "deleted"
-
-        # Mark all pending reminders as dismissed
         reminders = db.query(Reminder).filter(
             Reminder.user_phone == USER_PHONE,
             Reminder.status.in_(["pending", "sent"]),
         ).all()
-        for r in reminders:
-            r.status = "dismissed"
-
-        # Mark all pending action items as done
         items = db.query(ActionItem).filter(
             ActionItem.user_phone == USER_PHONE,
             ActionItem.status == "pending",
         ).all()
-        for item in items:
-            item.status = "done"
-            item.completed_at = now
 
-        db.commit()
         total = len(active_nags) + len(reminders) + len(items)
-        return f"Cleared all! Marked {total} items as done/dismissed."
+        if total == 0:
+            return "Nothing pending to mark as done!"
+
+        # Store confirmation
+        db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
+        db.add(PendingConfirmation(
+            user_phone=USER_PHONE,
+            action_type="acknowledge_all",
+            payload=_json.dumps({}),
+        ))
+        db.commit()
+        return f"Clear ALL {total} items ({len(active_nags)} nag(s), {len(reminders)} reminder(s), {len(items)} action(s))? Reply YES to confirm."
+
+    # Check if the raw message has meaningful keywords even if the parser didn't extract one
+    raw_message = data.get("_raw_message", "")
+    raw_keywords = [w.lower() for w in raw_message.split() if w.lower() not in _ACK_STOP_WORDS and len(w) > 1]
+    if not keyword and raw_keywords:
+        # Parser missed the keyword but the message has useful words — treat as keyword search
+        keyword = " ".join(raw_keywords)
 
     # No keyword — pick most recent active nag, then sent reminder, then action item
     if not keyword:
@@ -617,17 +701,15 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
         ).order_by(NagSchedule.next_nag_at.asc()).first()
 
         if nag:
-            if nag.repeating:
-                nag.active_since = None
-                nag.nag_until = None
-                nag.nag_count = 0
-                nag.next_nag_at = _next_nag_cycle(nag, now)
-                db.commit()
-                return f"Got it! \"{nag.label}\" done. Next cycle: {_format_time(nag.next_nag_at)}"
-            else:
-                nag.status = "deleted"
-                db.commit()
-                return f"Got it! \"{nag.label}\" done."
+            payload = {"matched_id": nag.id, "matched_type": "nag", "label": nag.label}
+            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
+            db.add(PendingConfirmation(
+                user_phone=USER_PHONE,
+                action_type="acknowledge",
+                payload=_json.dumps(payload),
+            ))
+            db.commit()
+            return f"Mark \"{nag.label}\" as done? Reply YES to confirm."
 
         reminder = db.query(Reminder).filter(
             Reminder.user_phone == USER_PHONE,
@@ -635,16 +717,15 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
         ).order_by(Reminder.sent_at.desc()).first()
 
         if reminder:
-            if reminder.parent_event_id:
-                for s in db.query(Reminder).filter(
-                    Reminder.parent_event_id == reminder.parent_event_id,
-                    Reminder.status.in_(["pending", "sent"]),
-                ).all():
-                    s.status = "dismissed"
-            else:
-                reminder.status = "dismissed"
+            payload = {"matched_id": reminder.id, "matched_type": "reminder", "label": reminder.label}
+            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
+            db.add(PendingConfirmation(
+                user_phone=USER_PHONE,
+                action_type="acknowledge",
+                payload=_json.dumps(payload),
+            ))
             db.commit()
-            return f"Dismissed: \"{reminder.label}\""
+            return f"Dismiss \"{reminder.label}\"? Reply YES to confirm."
 
         item = db.query(ActionItem).filter(
             ActionItem.user_phone == USER_PHONE,
@@ -652,23 +733,30 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
         ).order_by(ActionItem.next_remind_at.asc()).first()
 
         if item:
-            item.status = "done"
-            item.completed_at = now
+            payload = {"matched_id": item.id, "matched_type": "action", "label": item.description}
+            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
+            db.add(PendingConfirmation(
+                user_phone=USER_PHONE,
+                action_type="acknowledge",
+                payload=_json.dumps(payload),
+            ))
             db.commit()
-            return f"Done: \"{item.description}\""
+            return f"Mark \"{item.description}\" as done? Reply YES to confirm."
 
         return "Nothing pending to mark as done!"
 
     # Keyword provided — gather all acknowledgeable items and GPT fuzzy match
     ack_items = []
 
+    # Include ALL active nags (not just currently-nagging ones) so the user
+    # can mark a nag done even if it's between cycles / hasn't started yet.
     for n in db.query(NagSchedule).filter(
         NagSchedule.user_phone == USER_PHONE,
         NagSchedule.status == "active",
-        NagSchedule.active_since.isnot(None),
     ).all():
+        state = "ACTIVE" if n.active_since else "waiting"
         ack_items.append({"id": n.id, "type": "nag", "label": n.label,
-                          "detail": f"every {n.interval_minutes}min [ACTIVE]",
+                          "detail": f"every {n.interval_minutes}min [{state}]",
                           "message": n.message})
 
     for r in db.query(Reminder).filter(
@@ -684,26 +772,31 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
         ActionItem.status == "pending",
     ).order_by(ActionItem.created_at.desc()).all():
         ack_items.append({"id": a.id, "type": "action", "label": a.description,
-                          "detail": f"source: {a.source}" if a.source else ""})
+                          "detail": f"source: {a.source}" if a.source else "",
+                          "message": a.source_ref or a.description})
 
     if not ack_items:
         return "Nothing pending to mark as done!"
 
     original_message = data.get("_raw_message") or keyword
-    result = deduce_acknowledge_target(original_message, ack_items)
-    log.info("Acknowledge match result: %s", result)
 
-    if not result.get("matched_id"):
-        return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
-
-    try:
-        matched_id = int(result["matched_id"])
-    except (ValueError, TypeError):
-        return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
-
-    match = next((i for i in ack_items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+    # Try fast keyword matching first — only call GPT if ambiguous
+    match = _keyword_prefilter(original_message, ack_items, _ACK_STOP_WORDS)
     if not match:
-        return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+        result = deduce_acknowledge_target(original_message, ack_items)
+        log.info("Acknowledge match result: %s", result)
+
+        if not result.get("matched_id"):
+            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+        try:
+            matched_id = int(result["matched_id"])
+        except (ValueError, TypeError):
+            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+        match = next((i for i in ack_items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+        if not match:
+            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
 
     # Store confirmation
     payload = {"matched_id": match["id"], "matched_type": match["type"], "label": match["label"]}
@@ -766,7 +859,8 @@ def _handle_cancel(db: Session, data: dict) -> str:
             ActionItem.status == "pending",
         ).order_by(ActionItem.created_at.desc()).all():
             items.append({"id": a.id, "type": "action", "label": a.description,
-                          "detail": f"source: {a.source}" if a.source else ""})
+                          "detail": f"source: {a.source}" if a.source else "",
+                          "message": a.source_ref or a.description})
 
     if not items:
         return "Nothing to cancel!"
@@ -780,22 +874,24 @@ def _handle_cancel(db: Session, data: dict) -> str:
         # Only one cancellable item — just pick it
         match = items[0]
     else:
-        # Use GPT fuzzy matching with the full original message
+        # Try fast keyword matching first — only call GPT if ambiguous
         search_text = original_message or keyword
-        result = deduce_cancel_target(search_text, items)
-        log.info("Cancel match result: %s", result)
-
-        if not result.get("matched_id"):
-            return f"Couldn't find anything matching \"{keyword or original_message}\". Text LIST to see your items."
-
-        try:
-            matched_id = int(result["matched_id"])
-        except (ValueError, TypeError):
-            return f"Couldn't find anything matching \"{keyword or original_message}\". Text LIST to see your items."
-
-        match = next((i for i in items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+        match = _keyword_prefilter(search_text, items, _CANCEL_STOP_WORDS)
         if not match:
-            return f"Couldn't find anything matching \"{keyword or original_message}\". Text LIST to see your items."
+            result = deduce_cancel_target(search_text, items)
+            log.info("Cancel match result: %s", result)
+
+            if not result.get("matched_id"):
+                return f"Couldn't find anything matching \"{keyword or original_message}\". Text LIST to see your items."
+
+            try:
+                matched_id = int(result["matched_id"])
+            except (ValueError, TypeError):
+                return f"Couldn't find anything matching \"{keyword or original_message}\". Text LIST to see your items."
+
+            match = next((i for i in items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+            if not match:
+                return f"Couldn't find anything matching \"{keyword or original_message}\". Text LIST to see your items."
 
     # Store confirmation
     payload = {"matched_id": match["id"], "matched_type": match["type"], "label": match["label"]}
@@ -967,8 +1063,17 @@ def _handle_exercise_history(db: Session, data: dict) -> str:
     from zoneinfo import ZoneInfo
 
     tz = ZoneInfo(USER_TIMEZONE)
-    start = _date.fromisoformat(data["start_date"])
-    end = _date.fromisoformat(data["end_date"])
+    today = _date.today()
+
+    try:
+        start = _date.fromisoformat(data["start_date"])
+    except (KeyError, ValueError, TypeError):
+        start = today - timedelta(days=7)
+
+    try:
+        end = _date.fromisoformat(data["end_date"])
+    except (KeyError, ValueError, TypeError):
+        end = today
 
     # Convert date range to timezone-aware datetimes spanning the full days
     start_dt = datetime(start.year, start.month, start.day, tzinfo=tz).astimezone(timezone.utc)

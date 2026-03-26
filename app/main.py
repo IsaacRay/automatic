@@ -10,7 +10,7 @@ from app.database import engine, Base, SessionLocal
 from app.models import SmsLog, PendingConfirmation
 from app.config import USER_PHONE
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent, execute_reschedule, execute_cancel, execute_acknowledge
+from app.intent_router import handle_intent, execute_reschedule, execute_cancel, execute_acknowledge, execute_acknowledge_all
 from app.twilio_client import send_sms
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -79,6 +79,8 @@ async def incoming_sms(
                     reply = execute_cancel(db, payload)
                 elif action_type == "acknowledge":
                     reply = execute_acknowledge(db, payload)
+                elif action_type == "acknowledge_all":
+                    reply = execute_acknowledge_all(db, payload)
                 else:
                     reply = "Unknown confirmation type."
                 log.info("Confirmation accepted: %s", action_type)

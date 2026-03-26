@@ -57,7 +57,7 @@ Intent-specific data:
 - "label": short description of the event/reminder
 - "reminders": array of objects, each with:
   - "message": the SMS text to send
-  - "fire_at": ISO 8601 datetime string in UTC (convert from {USER_TIMEZONE})
+  - "fire_at": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC)
 For meetings/events: create TWO reminders — a prep reminder 30 minutes before AND the event reminder. Use parent_event_id to link them.
   - The 30-minute prep reminder message should say "Heads up — [event] at [event time, e.g. 2:00 PM]" so the user knows what's coming and when.
   - The event-time reminder message should say "Time for [event]" or similar.
@@ -93,7 +93,7 @@ A message like "nag me every 30 min to call the dentist" has ONLY interval=30, n
 - "anchor_to_completion": boolean (default false). If true, the NEXT cycle starts relative to when the user completes the task, not the cron schedule. Implies repeating=true. Example: "give dog meds every month, nag daily until done" — if due March 22 but completed March 24, next cycle starts April 24. Use this when the user says things like "adjust the next date based on when I finish" or implies a monthly/weekly task where timing shifts based on completion.
 - "cycle_months": integer or null. Number of months between cycles when anchor_to_completion is true (e.g. 1 for monthly).
 - "cycle_days": integer or null. Number of days between cycles when anchor_to_completion is true. Use this OR cycle_months, not both. For "every 2 weeks" use 14.
-- "first_nag_at": ISO 8601 datetime in UTC for when the FIRST cycle should start, if the user specifies a specific date (e.g. "starting March 22nd"). null if not specified (will use cron_expression to compute).
+- "first_nag_at": ISO 8601 datetime in {USER_TIMEZONE} local time (do NOT convert to UTC) for when the FIRST cycle should start, if the user specifies a specific date (e.g. "starting March 22nd"). null if not specified (will use cron_expression to compute).
 
 **acknowledge**: The user is marking something as done. Trigger words: "done", "finished", "completed", "got it", "handled".
 - "keyword": optional keyword to match a specific item (null to mark most recent)
@@ -106,7 +106,7 @@ Use this intent when the user wants to get rid of something they no longer need 
 
 **reschedule**: The user wants to move an existing reminder/event to a new time. Trigger words: "reschedule", "move", "change to", "push to", "bump to", "actually make it".
 - "keyword": keyword to match the existing reminder/event
-- "new_time": ISO 8601 datetime string in UTC for the new event time (convert from {USER_TIMEZONE})
+- "new_time": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC)
 - "original_message": the user's original message text verbatim (needed for fuzzy matching)
 
 **snooze**: The user wants to delay reminders. Trigger words: "snooze", "later", "not now", "remind me later".
@@ -191,9 +191,9 @@ def deduce_reschedule_target(user_message: str, items: list[dict], *, parsed_new
 
     time_hint = ""
     if parsed_new_time:
-        time_hint = f"\nThe user's intended new time has already been parsed as: {parsed_new_time} (UTC). Use this as the new_time unless it seems clearly wrong.\n"
+        time_hint = f"\nThe user's intended new time has already been parsed as: {parsed_new_time}. Use this as the new_time unless it seems clearly wrong.\n"
 
-    system_prompt = f"""You are helping match a reschedule request to the correct item.
+    system_prompt = f"""You are helping match a reschedule request to the correct item. The user has ADHD and texts very casually — expect abbreviations, typos, partial words, and terse messages.
 
 Current date/time: {now_local.strftime("%A, %B %d, %Y %I:%M %p")} ({USER_TIMEZONE})
 
@@ -203,16 +203,28 @@ The user sent this message wanting to reschedule something:
 Here are their pending items:
 {items_text}
 
-Determine which item the user most likely wants to reschedule and what the new time should be.
+MATCHING STRATEGY — try ALL of these, pick the best overall match:
+1. Substring/keyword: does ANY word in the user's message appear in the item's label? (e.g., "move dentist" matches "dentist appointment")
+2. Semantic/synonym: does the user's meaning match? (e.g., "push the doc appt" matches "dentist appointment", "move standup" matches "daily standup meeting")
+3. Time-based: does the user reference a time that matches an item's fire_at? (e.g., "move the 3pm thing" matches item firing at 3:00 PM)
+4. Abbreviation/shorthand: expand common abbreviations (e.g., "mtg"=meeting, "appt"=appointment, "dr"=doctor, "dent"=dentist, "esub"=Esub)
+5. Fuzzy/typo: allow off-by-one typos and phonetic similarity (e.g., "meating" matches "meeting")
+
+PRIORITY — match quality is king, item type/status is a tiebreaker:
+1. BEST keyword overlap wins — if the user's words appear literally in one item's label but not another's, pick that item regardless of type.
+2. More keyword overlap > less overlap.
+3. Exact substring > semantic similarity — a word literally appearing in a label beats a loosely related concept.
+4. Only use item type/status or time proximity as a tiebreaker when keyword match quality is equal.
+If only ONE item exists, match it unless the user's description actively contradicts it.
 
 Return a JSON object with:
 - "matched_id": the integer ID of the matched item (as an integer, not a string), or null if no reasonable match
 - "matched_type": "reminder" or "recurring"
-- "new_time": ISO 8601 datetime string in UTC for the new time (convert from {USER_TIMEZONE})
+- "new_time": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC)
 - "description": a short human-readable summary like "Dentist appointment → Wed Mar 5 3:00 PM"
 
 If you cannot determine a match, return {{"matched_id": null}}.
-Be generous — the user has ADHD and texts casually. Partial matches and fuzzy descriptions are fine."""
+Err on the side of matching — a false match can be rejected by the user via confirmation, but a false null means they have to retype."""
 
     content = _chat(
         [
@@ -243,7 +255,7 @@ def deduce_acknowledge_target(user_message: str, items: list[dict]) -> dict:
     except Exception:
         now_local = datetime.now()
 
-    system_prompt = f"""You are helping match a "done" / acknowledgment request to the correct item.
+    system_prompt = f"""You are helping match a "done" / acknowledgment request to the correct item. The user has ADHD and texts very casually — expect abbreviations, typos, partial words, and terse messages.
 
 Current date/time: {now_local.strftime("%A, %B %d, %Y %I:%M %p")} ({USER_TIMEZONE})
 
@@ -255,18 +267,27 @@ Here are their pending items:
 
 Each item has: id, type, label, detail (schedule/time info), and often a "message" field with the actual reminder text.
 
-Match the user's request to the BEST item using ALL available fields:
-- Match against label, message content, detail/time, and type
-- "done with dentist" → match any item mentioning dentist in label OR message
-- "finished the nag" → match a nag-type item
-- If multiple items could match, prefer the one that matches on MORE fields
+MATCHING STRATEGY — try ALL of these across ALL fields (label, message, detail), pick the best overall match:
+1. Substring/keyword: does ANY word in the user's message appear in any field? (e.g., "done dentist" matches label "dentist appointment" OR message "Time for dentist")
+2. Semantic/synonym: does the user's meaning match? (e.g., "finished the teeth thing" matches "dentist appointment", "done with meds" matches "take medication")
+3. Type-based: does the user reference a type? (e.g., "finished the nag" → prefer nag-type items, "done with the reminder" → prefer reminder-type)
+4. Time-based: does the user reference a time matching the detail? (e.g., "done with the 3pm" matches item with "fires 3:00 PM" in detail)
+5. Abbreviation/shorthand: expand common abbreviations (e.g., "ts"=timesheet, "mtg"=meeting, "appt"=appointment, "dr"=doctor, "dent"=dentist, "meds"=medication/medicine)
+6. Fuzzy/typo: allow off-by-one typos and phonetic similarity (e.g., "timesheat" matches "timesheet")
+
+PRIORITY — match quality is king, item type/status is a tiebreaker:
+1. BEST keyword overlap wins — if the user's words appear literally in one item's label but not another's, pick that item regardless of type. Example: "replace tire done" must match "Call to make appointment to replace tire and fix window" over "make an appointment for car window repair" because "replace tire" appears in the first label.
+2. More keyword overlap > less overlap — count how many of the user's words appear in each item's label/message. Pick the item with the most hits.
+3. Exact substring > semantic similarity — "tire" literally appearing in a label beats "car-related" semantic association.
+4. Only use item type/status as a tiebreaker when keyword match quality is equal.
+- If only ONE item exists, match it unless the user's message actively contradicts it.
 
 Return a JSON object with:
 - "matched_id": the integer ID of the matched item (as an integer, not a string), or null if no reasonable match
 - "matched_type": the "type" field of the matched item
 
 If you cannot determine a match, return {{"matched_id": null}}.
-Be generous — the user has ADHD and texts casually. Partial matches, abbreviations, and fuzzy descriptions should match. When in doubt, pick the most likely item rather than returning null."""
+Err on the side of matching — a false match can be rejected by the user via confirmation, but a false null means they have to retype."""
 
     content = _chat(
         [
@@ -297,7 +318,7 @@ def deduce_cancel_target(user_message: str, items: list[dict]) -> dict:
     except Exception:
         now_local = datetime.now()
 
-    system_prompt = f"""You are helping match a cancel/delete request to the correct item.
+    system_prompt = f"""You are helping match a cancel/delete request to the correct item. The user has ADHD and texts very casually — expect abbreviations, typos, partial words, and terse messages.
 
 Current date/time: {now_local.strftime("%A, %B %d, %Y %I:%M %p")} ({USER_TIMEZONE})
 
@@ -309,20 +330,29 @@ Here are their pending items:
 
 Each item has: id, type, label, detail (schedule/time info), and often a "message" field with the actual reminder text.
 
-Match the user's request to the BEST item using ALL available fields:
-- Match against label, message content, detail/time, and type
-- "cancel the 3pm thing" → match an item firing around 3pm
-- "nvm about dentist" → match any item mentioning dentist in label OR message
-- "forget the nag" → match a nag-type item
-- "cancel meeting" → match items with meeting in label or message
-- If multiple items could match, prefer the one that matches on MORE fields
+MATCHING STRATEGY — try ALL of these across ALL fields (label, message, detail), pick the best overall match:
+1. Substring/keyword: does ANY word in the user's message appear in any field? (e.g., "cancel dentist" matches label "dentist appointment" OR message "Time for dentist")
+2. Semantic/synonym: does the user's meaning match? (e.g., "nvm the teeth thing" matches "dentist appointment", "kill the meds nag" matches "take medication")
+3. Type-based: does the user reference a type? (e.g., "stop the nag" → prefer nag-type items, "cancel the reminder" → prefer reminder-type, "stop the recurring" → prefer recurring-type)
+4. Time-based: does the user reference a time matching the detail? (e.g., "cancel the 3pm thing" matches item with "fires 3:00 PM" in detail)
+5. Abbreviation/shorthand: expand common abbreviations (e.g., "ts"=timesheet, "mtg"=meeting, "appt"=appointment, "dr"=doctor, "dent"=dentist, "meds"=medication/medicine)
+6. Fuzzy/typo: allow off-by-one typos and phonetic similarity (e.g., "cancl meating" matches "meeting")
+
+Strip away cancel-intent words before matching keywords: ignore "cancel", "delete", "remove", "nvm", "nevermind", "forget", "stop", "kill", "drop", "get rid of", "the", "my", "that" — focus on the REMAINING words as the search terms.
+
+PRIORITY — match quality is king, item type/status is a tiebreaker:
+1. BEST keyword overlap wins — if the user's words appear literally in one item's label but not another's, pick that item regardless of type.
+2. More keyword overlap > less overlap — count how many of the user's words appear in each item's label/message. Pick the item with the most hits.
+3. Exact substring > semantic similarity — a word literally appearing in a label beats a loosely related concept.
+4. Only use item type/status as a tiebreaker when keyword match quality is equal.
+- If only ONE item exists, match it unless the user's message actively contradicts it.
 
 Return a JSON object with:
 - "matched_id": the integer ID of the matched item (as an integer, not a string), or null if no reasonable match
 - "matched_type": the "type" field of the matched item
 
 If you cannot determine a match, return {{"matched_id": null}}.
-Be generous — the user has ADHD and texts casually. Partial matches, abbreviations, and fuzzy descriptions should match. When in doubt, pick the most likely item rather than returning null."""
+Err on the side of matching — a false match can be rejected by the user via confirmation, but a false null means they have to retype."""
 
     content = _chat(
         [
