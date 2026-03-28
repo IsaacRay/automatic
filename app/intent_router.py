@@ -520,11 +520,9 @@ def _handle_create_nag(db: Session, data: dict) -> str:
     if deadline_at:
         # Deadline nags start active immediately, no cron cycling
         next_fire = now
-        max_iv = interval if interval and interval > 15 else 1440
         # No max_duration — the nag runs until done or cancelled
         max_dur = None
     else:
-        max_iv = None
         # Auto-default max_duration_minutes for repeating nags to prevent infinite nagging.
         # Exception: completion-anchored nags should nag indefinitely until acknowledged.
         if repeating and max_dur is None and not anchor:
@@ -561,7 +559,6 @@ def _handle_create_nag(db: Session, data: dict) -> str:
         cycle_days=cycle_days,
         deadline_at=deadline_at,
         min_interval_minutes=min_interval,
-        max_interval_minutes=max_iv,
         status="active",
     )
     if deadline_at:

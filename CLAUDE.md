@@ -56,9 +56,9 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
    - If `repeating=False`: Set `status="deleted"` (one-shot, done)
 
 **Deadline-based nags** (`deadline_at` set):
-- Nag frequency follows an exponential curve: infrequent far from deadline, very frequent near it
-- Curve: `interval = min_iv + (max_iv - min_iv) * fraction_remaining²` where `fraction_remaining = time_left / total_window`
-- `min_interval_minutes`: floor (default 5 min), `max_interval_minutes`: ceiling (default 1440 min)
+- Nag frequency follows Zeno's paradox: interval = half the remaining time, clamped to floor
+- Example: 1hr deadline → nag now, then 30min, 15min, 7.5min, ... until min_interval hit
+- `min_interval_minutes`: floor (default 5 min)
 - Past deadline: clamps to `min_interval_minutes`
 - Each nag message is GPT-generated with increasing urgency (LOW → MODERATE → HIGH → CRITICAL → OVERDUE)
 - Start active immediately (`active_since=now` at creation), no cron cycling
