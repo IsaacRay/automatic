@@ -52,13 +52,13 @@ async def incoming_sms(
             reply = _handle_create_nag(db, {
                 "label": label,
                 "message": f"Reminder: {label}",
-                "interval_minutes": 60,
+                "interval_minutes": 120,
                 "first_nag_at": now_iso,
             })
             # Send the first nag immediately to the user
             send_sms(USER_PHONE, f"Reminder: {label}")
             # Send confirmation to the 973 number
-            send_sms(KATHRYN_PHONE, f"Reminder created: \"{label}\" (every 60 min)")
+            send_sms(KATHRYN_PHONE, f"Reminder created: \"{label}\" (every 2 hrs)")
             db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=""))
             db.commit()
         except Exception:

@@ -147,7 +147,7 @@ def sync_gmail_action_items():
                 label=desc,
                 message=desc,
                 cron_expression="0 9 * * *",
-                interval_minutes=60,
+                interval_minutes=120,
                 max_duration_minutes=None,
                 timezone=USER_TIMEZONE,
                 next_nag_at=now,

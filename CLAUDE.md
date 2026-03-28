@@ -55,12 +55,26 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
    - If `repeating=True`: Reset to dormant, schedule next cycle via cron
    - If `repeating=False`: Set `status="deleted"` (one-shot, done)
 
+**Deadline-based nags** (`deadline_at` set):
+- Nag frequency follows an exponential curve: infrequent far from deadline, very frequent near it
+- Curve: `interval = min_iv + (max_iv - min_iv) * fraction_remaining²` where `fraction_remaining = time_left / total_window`
+- `min_interval_minutes`: floor (default 5 min), `max_interval_minutes`: ceiling (default 1440 min)
+- Past deadline: clamps to `min_interval_minutes`
+- Each nag message is GPT-generated with increasing urgency (LOW → MODERATE → HIGH → CRITICAL → OVERDUE)
+- Start active immediately (`active_since=now` at creation), no cron cycling
+- Fallback static message on GPT failure
+
+**Quiet hours** (all nags):
+- No nags sent between `QUIET_HOURS_START` (default 0 = midnight) and `QUIET_HOURS_END` (default 6 = 6 AM) local time
+- If a nag is due during quiet hours, `next_nag_at` is pushed to `QUIET_HOURS_END`
+- After quiet hours end, deadline curve naturally computes a shorter interval (catching up)
+
 **Completion-anchored nags** (`anchor_to_completion=True`):
 - Next cycle starts relative to when user marks DONE, not the cron schedule
 - Uses `cycle_months` or `cycle_days` + `_next_nag_cycle()` with `relativedelta`
 
 **Gmail-sourced nags** (`source="gmail"`):
-- Created by `gmail_sync.py` with `interval_minutes=60`, `repeating=False`, `max_duration_minutes=NULL` (nag indefinitely until done)
+- Created by `gmail_sync.py` with `interval_minutes=120`, `repeating=False`, `max_duration_minutes=NULL` (nag indefinitely until done)
 - `source_ref` stores the email reference string for dedup
 - `ProcessedEmail` table tracks Gmail Message-ID headers to prevent re-analyzing emails on restart
 
@@ -134,7 +148,7 @@ On startup: sends recovery notification SMS, runs column migrations.
 
 All config is via environment variables with sensible defaults. Credentials fall back to reading from files in `/home/iray/`.
 
-Key settings: `DATABASE_URL`, `OPENAI_API_KEY`, `TWILIO_*`, `USER_PHONE`, `USER_TIMEZONE`, `TICK_SECONDS`, `GMAIL_*`, `WEATHERAPI_KEY`, `BRIEFING_TIME`, `EXERCISE_*_TIME`, `BASEMENT_LIGHT_ON/OFF`.
+Key settings: `DATABASE_URL`, `OPENAI_API_KEY`, `TWILIO_*`, `USER_PHONE`, `USER_TIMEZONE`, `TICK_SECONDS`, `GMAIL_*`, `WEATHERAPI_KEY`, `BRIEFING_TIME`, `EXERCISE_*_TIME`, `BASEMENT_LIGHT_ON/OFF`, `QUIET_HOURS_START`, `QUIET_HOURS_END`, `DEFAULT_MIN_INTERVAL`, `DEFAULT_MAX_INTERVAL`.
 
 ## Development Notes
 
@@ -142,6 +156,6 @@ Key settings: `DATABASE_URL`, `OPENAI_API_KEY`, `TWILIO_*`, `USER_PHONE`, `USER_
 - `_keyword_prefilter()` tries fast substring matching before calling GPT for acknowledge/cancel — saves API calls
 - `with_for_update(skip_locked=True)` used in scheduler queries to prevent double-firing
 - `_random_nag_time()` picks a random 9am-5pm time when user doesn't specify one
-- Auto-nag phone (`+19739787648`) allows external systems to create nags by texting
+- Auto-nag phone (`+19739787648`) allows external systems to create nags at 2-hour intervals by texting
 - Every inbound SMS from the user hits OpenAI for intent parsing; no local pre-parsing
 - Recurring reminders use static message text — no GPT generation at fire time

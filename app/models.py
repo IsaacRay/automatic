@@ -66,6 +66,9 @@ class NagSchedule(Base):
     status = Column(String(20), nullable=False, default="active")
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    deadline_at = Column(DateTime(timezone=True), nullable=True)
+    min_interval_minutes = Column(Integer, nullable=True)
+    max_interval_minutes = Column(Integer, nullable=True)
 
 
 class ProcessedEmail(Base):

@@ -14,6 +14,7 @@ from app.config import (
     USER_PHONE, USER_TIMEZONE, TICK_SECONDS, GMAIL_SYNC_INTERVAL,
     BASEMENT_LIGHT_ON, BASEMENT_LIGHT_OFF, BRIEFING_TIME,
     EXERCISE_MORNING_TIME, EXERCISE_EVENING_TIME,
+    QUIET_HOURS_START, QUIET_HOURS_END, DEFAULT_MIN_INTERVAL, DEFAULT_MAX_INTERVAL,
 )
 from app.twilio_client import send_sms
 from app.intent_router import _next_cron_fire, _next_nag_cycle
@@ -113,6 +114,35 @@ def fire_due_reminders(db):
             db.rollback()
 
 
+def _is_quiet_hours(tz_name):
+    """Return True if the current local time is within quiet hours."""
+    from zoneinfo import ZoneInfo
+    local_now = datetime.now(ZoneInfo(tz_name))
+    hour = local_now.hour
+    if QUIET_HOURS_START < QUIET_HOURS_END:
+        return QUIET_HOURS_START <= hour < QUIET_HOURS_END
+    else:  # wraps midnight, e.g., 22 to 6
+        return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
+
+
+def _compute_deadline_interval(nag, now):
+    """Compute dynamic interval for deadline-based nags using an exponential curve."""
+    min_iv = nag.min_interval_minutes or DEFAULT_MIN_INTERVAL
+    max_iv = nag.max_interval_minutes or DEFAULT_MAX_INTERVAL
+
+    if not nag.deadline_at or now >= nag.deadline_at:
+        return min_iv  # Past deadline: nag at maximum frequency
+
+    total_window = (nag.deadline_at - nag.created_at).total_seconds()
+    if total_window <= 0:
+        return min_iv
+
+    time_remaining = (nag.deadline_at - now).total_seconds()
+    fraction_remaining = max(0.0, min(1.0, time_remaining / total_window))
+    interval = min_iv + (max_iv - min_iv) * (fraction_remaining ** 2)
+    return max(min_iv, int(round(interval)))
+
+
 def fire_due_nags(db):
     """Process nag schedules: start cycles, send nags, end expired cycles."""
     now = datetime.now(timezone.utc)
@@ -160,19 +190,49 @@ def fire_due_nags(db):
                     nag.nag_until = None
                 nag.nag_count = 0
 
+            # Quiet hours gate — applies to all nag types
+            if _is_quiet_hours(nag.timezone):
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(nag.timezone)
+                local_now = datetime.now(tz)
+                resume_at = local_now.replace(hour=QUIET_HOURS_END, minute=0, second=0, microsecond=0)
+                if resume_at <= local_now:
+                    resume_at += timedelta(days=1)
+                nag.next_nag_at = resume_at.astimezone(timezone.utc)
+                db.commit()
+                log.info("Nag #%d deferred to %s (quiet hours): %s", nag.id, resume_at, nag.label)
+                continue
+
             # Case 3: Send nag (both new cycle first nag and ongoing)
             nag_num = nag.nag_count + 1
-            msg = nag.message
-            if nag_num > 1:
-                msg = f"(#{nag_num}) {msg}"
-            msg += "\nReply DONE when finished."
+
+            if nag.deadline_at:
+                try:
+                    from app.openai_client import generate_deadline_nag_message
+                    msg = generate_deadline_nag_message(nag, now)
+                except Exception:
+                    log.exception("GPT deadline message failed for nag #%d, using fallback", nag.id)
+                    msg = f"(#{nag_num}) {nag.label} — deadline approaching!\nReply DONE when finished."
+            else:
+                msg = nag.message
+                if nag_num > 1:
+                    msg = f"(#{nag_num}) {msg}"
+
+            if not msg.rstrip().endswith("Reply DONE when finished."):
+                msg += "\nReply DONE when finished."
 
             result = send_sms(nag.user_phone, msg)
             nag.nag_count = nag_num
-            nag.next_nag_at = now + timedelta(minutes=nag.interval_minutes)
+
+            if nag.deadline_at:
+                interval = _compute_deadline_interval(nag, now)
+            else:
+                interval = nag.interval_minutes
+
+            nag.next_nag_at = now + timedelta(minutes=interval)
             _log_outbound(db, msg, result.get("sid", ""), "nag", nag.id)
             db.commit()
-            log.info("Fired nag #%d (count=%d): %s", nag.id, nag_num, nag.label)
+            log.info("Fired nag #%d (count=%d, interval=%dm): %s", nag.id, nag_num, interval, nag.label)
 
         except Exception:
             log.exception("Failed to process nag #%d", nag.id)
@@ -330,6 +390,15 @@ def main():
             ))
             conn.execute(text(
                 "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ"
+            ))
+            conn.execute(text(
+                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ"
+            ))
+            conn.execute(text(
+                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS min_interval_minutes INTEGER"
+            ))
+            conn.execute(text(
+                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS max_interval_minutes INTEGER"
             ))
             conn.execute(text(
                 "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS cron_expression VARCHAR(100)"

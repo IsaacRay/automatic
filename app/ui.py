@@ -141,14 +141,20 @@ def nags_page():
                 anchor = f"&#x2693; {period}"
             repeating = r.recurrence_description if r.recurrence_description else ("Yes" if r.repeating else "No")
             source = r.source or "-"
+            deadline = _fmt(r.deadline_at) if r.deadline_at else "-"
+            if r.deadline_at:
+                interval_display = "auto"
+            else:
+                interval_display = f"{r.interval_minutes}m"
             trs += f"""<tr>
               <td>{r.id}</td>
               <td>{r.label}</td>
               <td>{source}</td>
               <td>{r.cron_expression}</td>
-              <td>{r.interval_minutes}m</td>
+              <td>{interval_display}</td>
               <td>{dur}</td>
               <td>{repeating}</td>
+              <td>{deadline}</td>
               <td>{_fmt(r.next_nag_at)}</td>
               <td class="status-{r.status}">{r.status}</td>
               <td>{active}</td>
@@ -167,7 +173,7 @@ def nags_page():
 
         table = f"""<h2>Nags ({len(rows)})</h2>
         {cleanup_btn}
-        <table><tr><th>ID</th><th>Label</th><th>Source</th><th>Cron</th><th>Interval</th><th>Duration</th><th>Repeating</th><th>Next Nag</th><th>Status</th><th>Active</th><th>Anchor</th><th></th></tr>
+        <table><tr><th>ID</th><th>Label</th><th>Source</th><th>Cron</th><th>Interval</th><th>Duration</th><th>Repeating</th><th>Deadline</th><th>Next Nag</th><th>Status</th><th>Active</th><th>Anchor</th><th></th></tr>
         {trs}</table>"""
         return _render_page(table)
     finally:

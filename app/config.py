@@ -61,6 +61,12 @@ GOOGLE_CALENDAR_ICS = os.environ.get(
     "https://calendar.google.com/calendar/ical/isaacmray1984%40gmail.com/private-6c66bacfc8241c9fa97fe2985e7b2ba7/basic.ics",
 )
 
+# Quiet hours — no nags sent during this window (local time)
+QUIET_HOURS_START = int(os.environ.get("QUIET_HOURS_START", "0"))   # midnight
+QUIET_HOURS_END = int(os.environ.get("QUIET_HOURS_END", "6"))       # 6 AM
+DEFAULT_MIN_INTERVAL = int(os.environ.get("DEFAULT_MIN_INTERVAL", "5"))
+DEFAULT_MAX_INTERVAL = int(os.environ.get("DEFAULT_MAX_INTERVAL", "1440"))
+
 # Basement light webhooks (IFTTT)
 BASEMENT_LIGHT_ON = os.environ.get("BASEMENT_LIGHT_ON", "")
 BASEMENT_LIGHT_OFF = os.environ.get("BASEMENT_LIGHT_OFF", "")

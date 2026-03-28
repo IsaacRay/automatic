@@ -91,6 +91,8 @@ A message like "nag me every 30 min to call the dentist" has ONLY interval=30, n
 - "cycle_months": integer or null. Number of months between cycles when anchor_to_completion is true (e.g. 1 for monthly).
 - "cycle_days": integer or null. Number of days between cycles when anchor_to_completion is true. Use this OR cycle_months, not both. For "every 2 weeks" use 14.
 - "first_nag_at": ISO 8601 datetime in {USER_TIMEZONE} local time (do NOT convert to UTC) for when the FIRST cycle should start, if the user specifies a specific date (e.g. "starting March 22nd"). null if not specified (will use cron_expression to compute).
+- "deadline_at": ISO 8601 datetime in {USER_TIMEZONE} local time (do NOT convert to UTC). Set when the user specifies a hard deadline (e.g. "by 5pm", "before Friday", "deadline is March 30", "due by end of day"). When a deadline is present, the system will automatically ramp up nag frequency as the deadline approaches using an exponential curve — no need to set interval_minutes. null if no deadline specified.
+- "min_interval_minutes": integer or null. Minimum nag interval in minutes (floor for the deadline curve). Set when the user says things like "but no more than every 10 min" or "minimum 15 min apart". Default is 5 if not specified.
 
 **acknowledge**: The user is marking something as done. Trigger words: "done", "finished", "completed", "got it", "handled".
 - "keyword": optional keyword to match a specific item (null to mark most recent)
@@ -144,6 +146,51 @@ Be generous in interpretation — this is for someone with ADHD who texts casual
         json_mode=True,
     )
     return json.loads(content)
+
+
+def generate_deadline_nag_message(nag, now) -> str:
+    """Generate a dynamic nag message with urgency based on deadline proximity."""
+    time_remaining = nag.deadline_at - now
+    total_seconds = time_remaining.total_seconds()
+
+    if total_seconds <= 0:
+        urgency = "OVERDUE"
+        mins_over = abs(int(total_seconds // 60))
+        if mins_over < 60:
+            time_desc = f"overdue by {mins_over} minutes"
+        else:
+            time_desc = f"overdue by {mins_over // 60} hours"
+    elif total_seconds < 3600:
+        urgency = "CRITICAL"
+        time_desc = f"{int(total_seconds // 60)} minutes left"
+    elif total_seconds < 14400:  # 4 hours
+        urgency = "HIGH"
+        time_desc = f"{total_seconds / 3600:.1f} hours left"
+    elif total_seconds < 86400:  # 24 hours
+        urgency = "MODERATE"
+        time_desc = f"{total_seconds / 3600:.0f} hours left"
+    else:
+        urgency = "LOW"
+        time_desc = f"{total_seconds / 86400:.0f} days left"
+
+    system_prompt = (
+        "You are an ADHD accountability buddy sending SMS nags. "
+        "Generate a SHORT (under 140 chars) nag message for the task described below. "
+        f"Urgency level: {urgency}. Time remaining: {time_desc}. "
+        "Match tone to urgency: LOW=gentle reminder, MODERATE=encouraging nudge, "
+        "HIGH=firm push, CRITICAL=urgent alarm, OVERDUE=stern but supportive. "
+        "Include the time remaining naturally. Do NOT use hashtags or emojis. "
+        "Vary your phrasing — don't repeat the same structure."
+    )
+
+    content = _chat(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Task: {nag.label} (nag #{nag.nag_count + 1})"},
+        ],
+        temperature=0.8,
+    )
+    return content.strip()
 
 
 def deduce_reschedule_target(user_message: str, items: list[dict], *, parsed_new_time: str = "") -> dict:

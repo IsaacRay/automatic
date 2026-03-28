@@ -506,30 +506,44 @@ def _handle_create_nag(db: Session, data: dict) -> str:
     first_nag_at = data.get("first_nag_at")
     user_specified_time = data.get("user_specified_time", True)
     recurrence_desc = data.get("recurrence_description")
+    deadline_at_str = data.get("deadline_at")
+    min_interval = data.get("min_interval_minutes")
 
     # Default cron if none provided
     if not cron_expr:
         cron_expr = "0 12 * * *"
 
-    # Auto-default max_duration_minutes for repeating nags to prevent infinite nagging.
-    # Exception: completion-anchored nags should nag indefinitely until acknowledged.
-    if repeating and max_dur is None and not anchor:
-        cron_dow = cron_expr.split()[4] if len(cron_expr.split()) >= 5 else "*"
-        if cycle_months or "monthly" in (recurrence_desc or "").lower():
-            max_dur = 2880   # 48 hours for monthly
-        elif cycle_days and cycle_days >= 7:
-            max_dur = 1440   # 24 hours for weekly
-        elif cron_dow not in ("*", "0-6", "0,1,2,3,4,5,6"):
-            max_dur = 720    # 12 hours for weekday/partial-week
-        else:
-            max_dur = 720    # 12 hours default for daily
+    # Parse deadline
+    deadline_at = _parse_dt(deadline_at_str) if deadline_at_str else None
+    now = datetime.now(timezone.utc)
 
-    if first_nag_at:
-        next_fire = _parse_dt(first_nag_at)
-    elif not user_specified_time:
-        next_fire = _random_nag_time()
+    if deadline_at:
+        # Deadline nags start active immediately, no cron cycling
+        next_fire = now
+        max_iv = interval if interval and interval > 15 else 1440
+        # No max_duration — the nag runs until done or cancelled
+        max_dur = None
     else:
-        next_fire = _next_cron_fire(cron_expr, USER_TIMEZONE)
+        max_iv = None
+        # Auto-default max_duration_minutes for repeating nags to prevent infinite nagging.
+        # Exception: completion-anchored nags should nag indefinitely until acknowledged.
+        if repeating and max_dur is None and not anchor:
+            cron_dow = cron_expr.split()[4] if len(cron_expr.split()) >= 5 else "*"
+            if cycle_months or "monthly" in (recurrence_desc or "").lower():
+                max_dur = 2880   # 48 hours for monthly
+            elif cycle_days and cycle_days >= 7:
+                max_dur = 1440   # 24 hours for weekly
+            elif cron_dow not in ("*", "0-6", "0,1,2,3,4,5,6"):
+                max_dur = 720    # 12 hours for weekday/partial-week
+            else:
+                max_dur = 720    # 12 hours default for daily
+
+        if first_nag_at:
+            next_fire = _parse_dt(first_nag_at)
+        elif not user_specified_time:
+            next_fire = _random_nag_time()
+        else:
+            next_fire = _next_cron_fire(cron_expr, USER_TIMEZONE)
 
     nag = NagSchedule(
         user_phone=USER_PHONE,
@@ -545,18 +559,30 @@ def _handle_create_nag(db: Session, data: dict) -> str:
         anchor_to_completion=anchor,
         cycle_months=cycle_months,
         cycle_days=cycle_days,
+        deadline_at=deadline_at,
+        min_interval_minutes=min_interval,
+        max_interval_minutes=max_iv,
         status="active",
     )
+    if deadline_at:
+        nag.active_since = now
+        nag.nag_count = 0
     db.add(nag)
     db.commit()
 
     # Build confirmation message
-    parts = [f"Nag set: \"{label}\" every {interval} min"]
-    if recurrence_desc:
-        parts.append(f", {recurrence_desc}")
-    if anchor:
-        period = f"{cycle_months} month(s)" if cycle_months else f"{cycle_days} day(s)"
-        parts.append(f", next cycle {period} after completion")
+    if deadline_at:
+        past_warning = " (deadline already passed — nagging at max frequency!)" if deadline_at <= now else ""
+        parts = [f"Deadline nag set: \"{label}\" due {_format_time(deadline_at)}{past_warning}"]
+        if min_interval:
+            parts.append(f" (min interval: {min_interval}min)")
+    else:
+        parts = [f"Nag set: \"{label}\" every {interval} min"]
+        if recurrence_desc:
+            parts.append(f", {recurrence_desc}")
+        if anchor:
+            period = f"{cycle_months} month(s)" if cycle_months else f"{cycle_days} day(s)"
+            parts.append(f", next cycle {period} after completion")
     parts.append(f". First: {_format_time(next_fire)}")
     return "".join(parts)
 
@@ -845,7 +871,11 @@ def _handle_list(db: Session, data: dict) -> str:
             state = "ACTIVE" if n.active_since else "waiting"
             recurrence = f" ({n.recurrence_description})" if n.recurrence_description else ""
             src = f" [from: {n.source}]" if n.source else ""
-            lines.append(f"  - {n.label} every {n.interval_minutes}min{recurrence} [{state}]{src} (next: {_format_time(n.next_nag_at)})")
+            if n.deadline_at:
+                interval_desc = f" deadline: {_format_time(n.deadline_at)}"
+            else:
+                interval_desc = f" every {n.interval_minutes}min"
+            lines.append(f"  - {n.label}{interval_desc}{recurrence} [{state}]{src} (next: {_format_time(n.next_nag_at)})")
 
     if not lines:
         return "All clear! Nothing pending."
