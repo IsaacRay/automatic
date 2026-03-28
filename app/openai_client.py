@@ -48,13 +48,14 @@ def parse_user_sms(message: str) -> dict:
 Current date/time: {now_local.strftime("%A, %B %d, %Y %I:%M %p")} ({USER_TIMEZONE})
 
 Return a JSON object with:
-- "intent": one of "create_reminder", "create_recurring", "create_nag", "reschedule", "acknowledge", "cancel", "snooze", "list", "briefing", "help", "log_exercise", "exercise_history", "unknown"
+- "intent": one of "create_reminder", "create_nag", "reschedule", "acknowledge", "cancel", "snooze", "list", "briefing", "help", "log_exercise", "exercise_history", "unknown"
 - "data": intent-specific fields (see below)
 
 Intent-specific data:
 
-**create_reminder**: The user wants to be reminded about something at a specific time.
+**create_reminder**: The user wants to be reminded about something — either once at a specific time, or on a recurring schedule.
 - "label": short description of the event/reminder
+- "message": the SMS text to send (e.g., "Reminder: Dr Watson appointment")
 - "reminders": array of objects, each with:
   - "message": the SMS text to send
   - "fire_at": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC)
@@ -62,14 +63,10 @@ For meetings/events: create TWO reminders — a prep reminder 30 minutes before 
   - The 30-minute prep reminder message should say "Heads up — [event] at [event time, e.g. 2:00 PM]" so the user knows what's coming and when.
   - The event-time reminder message should say "Time for [event]" or similar.
 - "parent_event_id": a unique string to group related reminders (use format "evt_<timestamp>")
-
-**create_recurring**: The user wants repeated messages on a schedule.
-- "label": short description
-- "cron_expression": standard 5-field cron expression (minute hour day month weekday)
-- "message_prompt": a prompt to send to an AI each firing to generate a fresh, varied message. Should capture the spirit/purpose of what the user wants.
+- "cron_expression": optional, 5-field cron expression for recurring reminders (minute hour day month weekday). Set this when the user wants to be reminded on a recurring schedule (e.g., "every Tuesday at 3pm" → "0 15 * * 2", "every day at 5pm" → "0 17 * * *", "every weekday at 9am" → "0 9 * * 1-5"). Do NOT set this for one-time reminders. When cron_expression is set, do NOT use parent_event_id or create prep/event pairs — just provide a single "message" field with the reminder text.
 
 **create_nag**: The user wants to be nagged repeatedly at a fixed interval until they reply "done". Trigger words: "nag", "keep reminding", "bug me", "pester", "every X minutes until", "nag me".
-This is different from create_recurring (which fires once per schedule) — nags repeat rapidly within a window until acknowledged.
+This is different from a recurring reminder (which fires once per schedule) — nags repeat rapidly within a window until acknowledged.
 
 IMPORTANT — distinguish TWO separate concepts:
   (a) INTERVAL: how often to nag within a single cycle (e.g. "every 15 min" → interval_minutes=15). This is the rapid nagging frequency.
@@ -147,25 +144,6 @@ Be generous in interpretation — this is for someone with ADHD who texts casual
         json_mode=True,
     )
     return json.loads(content)
-
-
-def generate_recurring_message(prompt: str) -> str:
-    """Generate a fresh motivational/reminder message for a recurring schedule.
-
-    Called by the scheduler each time a recurring schedule fires.
-    """
-    return _chat(
-        [
-            {
-                "role": "system",
-                "content": "Generate a short, encouraging SMS message (under 160 characters). "
-                "Be varied and creative — never repeat the same phrasing. "
-                "Keep it warm, direct, and actionable.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.9,
-    )
 
 
 def deduce_reschedule_target(user_message: str, items: list[dict], *, parsed_new_time: str = "") -> dict:
@@ -382,7 +360,8 @@ def extract_action_items_structured(emails: list[dict]) -> list[dict]:
                 "content": "You are analyzing emails sent from Kathryn to Isaac. "
                 "Extract individual action items — tasks, replies needed, decisions, favors. "
                 "Return a JSON object with an 'items' array. Each item has:\n"
-                '- "description": concise action item text\n'
+                '- "description": short, actionable text suitable as an SMS reminder (e.g. "Call dentist to reschedule", "Reply to Kathryn about dinner plans"). '
+                "Do NOT include email metadata, dates, subjects, or sender info in the description — just the task itself.\n"
                 '- "source_ref": "Email: <subject> (<date>)"\n\n'
                 "If no action items exist, return {\"items\": []}.",
             },

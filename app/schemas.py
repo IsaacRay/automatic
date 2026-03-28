@@ -10,14 +10,10 @@ class ReminderData(BaseModel):
 
 class CreateReminderIntent(BaseModel):
     label: str
-    reminders: list[ReminderData]
+    reminders: list[ReminderData] = []
     parent_event_id: str | None = None
-
-
-class CreateRecurringIntent(BaseModel):
-    label: str
-    cron_expression: str
-    message_prompt: str
+    cron_expression: str | None = None
+    message: str | None = None
 
 
 class AcknowledgeIntent(BaseModel):

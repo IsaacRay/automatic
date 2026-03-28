@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import Reminder, RecurringSchedule, ActionItem, PendingConfirmation, NagSchedule, ExerciseLog
+from app.models import Reminder, PendingConfirmation, NagSchedule, ExerciseLog
 from app.config import USER_PHONE, USER_TIMEZONE
 
 
@@ -87,17 +87,6 @@ def _next_nag_cycle(nag, completion_time: datetime = None) -> datetime:
     return _next_cron_fire(nag.cron_expression, nag.timezone)
 
 
-def _backoff_delta(remind_count: int) -> timedelta:
-    """Compute the backoff delay for action item re-reminders."""
-    if remind_count == 0:
-        return timedelta(hours=0)  # immediate
-    elif remind_count == 1:
-        return timedelta(hours=4)
-    elif remind_count == 2:
-        return timedelta(hours=24)
-    else:
-        return timedelta(hours=48)
-
 
 _ACK_STOP_WORDS = frozenset({
     "done", "finished", "completed", "got", "handled", "did", "do",
@@ -145,7 +134,6 @@ def handle_intent(db: Session, parsed: dict) -> str:
 
     handlers = {
         "create_reminder": _handle_create_reminder,
-        "create_recurring": _handle_create_recurring,
         "create_nag": _handle_create_nag,
         "reschedule": _handle_reschedule,
         "acknowledge": _handle_acknowledge,
@@ -167,10 +155,34 @@ def _handle_create_reminder(db: Session, data: dict) -> str:
     label = data.get("label", "Reminder")
     reminders_data = data.get("reminders", [])
     parent_event_id = data.get("parent_event_id") or f"evt_{uuid.uuid4().hex[:12]}"
+    cron_expr = data.get("cron_expression")
 
-    if not reminders_data:
+    if not reminders_data and not cron_expr:
         return "I couldn't figure out when to remind you. Try again with a time?"
 
+    # Recurring reminder (has cron_expression)
+    if cron_expr:
+        message = data.get("message") or f"Reminder: {label}"
+        if reminders_data:
+            fire_at = _parse_dt(reminders_data[0]["fire_at"])
+            message = reminders_data[0].get("message", message)
+        else:
+            fire_at = _next_cron_fire(cron_expr, USER_TIMEZONE)
+
+        reminder = Reminder(
+            user_phone=USER_PHONE,
+            label=label,
+            fire_at=fire_at,
+            message=message,
+            cron_expression=cron_expr,
+            timezone=USER_TIMEZONE,
+            status="pending",
+        )
+        db.add(reminder)
+        db.commit()
+        return f"Recurring reminder set: \"{label}\" ({cron_expr}). Next: {_format_time(fire_at)}"
+
+    # One-shot reminder(s)
     created = []
     for r in reminders_data:
         fire_at = _parse_dt(r["fire_at"])
@@ -209,17 +221,11 @@ def _handle_reschedule(db: Session, data: dict) -> str:
     # The initial parse may have already extracted the new time — pass as hint
     parsed_new_time = data.get("new_time", "")
 
-    # Gather all pending reminders
+    # Gather all pending reminders (includes recurring ones)
     reminders = db.query(Reminder).filter(
         Reminder.user_phone == USER_PHONE,
         Reminder.status.in_(["pending", "sent"]),
     ).order_by(Reminder.fire_at.asc()).all()
-
-    # Gather all active recurring schedules
-    recurring = db.query(RecurringSchedule).filter(
-        RecurringSchedule.user_phone == USER_PHONE,
-        RecurringSchedule.status == "active",
-    ).order_by(RecurringSchedule.next_fire_at.asc()).all()
 
     # De-duplicate event pairs: for reminders sharing a parent_event_id,
     # only show the event-time (latest fire_at) entry to avoid confusing the matcher
@@ -235,22 +241,16 @@ def _handle_reschedule(db: Session, data: dict) -> str:
 
     items = []
     for r in list(event_groups.values()) + standalone:
+        rtype = "recurring" if r.cron_expression else "reminder"
         items.append({
             "id": r.id,
-            "type": "reminder",
+            "type": rtype,
             "label": r.label,
             "fire_at": r.fire_at.isoformat() if r.fire_at else None,
         })
-    for s in recurring:
-        items.append({
-            "id": s.id,
-            "type": "recurring",
-            "label": s.label,
-            "fire_at": s.next_fire_at.isoformat() if s.next_fire_at else None,
-        })
 
     if not items:
-        return "No pending reminders or recurring schedules to reschedule!"
+        return "No pending reminders to reschedule!"
 
     # Ask GPT-4o to fuzzy-match, passing the already-parsed time as a hint
     result = deduce_reschedule_target(original_message, items, parsed_new_time=parsed_new_time)
@@ -313,7 +313,7 @@ def execute_reschedule(db: Session, payload: dict) -> str:
 
     event_time_str = _format_time(new_event_time)
 
-    if matched_type == "reminder":
+    if matched_type in ("reminder", "recurring"):
         reminder = db.query(Reminder).filter(
             Reminder.id == matched_id,
             Reminder.status.in_(["pending", "sent"]),
@@ -331,8 +331,6 @@ def execute_reschedule(db: Session, payload: dict) -> str:
             ).order_by(Reminder.fire_at.asc()).all()
 
             if len(siblings) == 2:
-                # Prep reminder (earlier) gets new_event_time - 30min,
-                # event reminder (later) gets new_event_time
                 siblings[0].fire_at = new_prep_time
                 siblings[0].status = "pending"
                 siblings[0].message = f"Heads up \u2014 {label} at {event_time_str}"
@@ -342,7 +340,6 @@ def execute_reschedule(db: Session, payload: dict) -> str:
                 log.info("Rescheduled event pair (ids %d, %d) to prep=%s event=%s",
                          siblings[0].id, siblings[1].id, new_prep_time, new_event_time)
             else:
-                # Single survivor or >2 siblings — set all to event time
                 for s in siblings:
                     s.fire_at = new_event_time
                     s.status = "pending"
@@ -357,21 +354,8 @@ def execute_reschedule(db: Session, payload: dict) -> str:
 
         db.commit()
         time_str = _format_time(new_event_time)
-        return f"Rescheduled \"{reminder.label}\" to {time_str}"
-
-    elif matched_type == "recurring":
-        schedule = db.query(RecurringSchedule).filter(
-            RecurringSchedule.id == matched_id,
-            RecurringSchedule.status == "active",
-        ).first()
-        if not schedule:
-            return "That recurring schedule no longer exists."
-
-        schedule.next_fire_at = new_event_time
-        db.commit()
-        log.info("Rescheduled recurring #%d next fire to %s", schedule.id, new_event_time)
-        time_str = _format_time(new_event_time)
-        return f"Rescheduled recurring \"{schedule.label}\" — next fire: {time_str}"
+        prefix = "Rescheduled recurring" if reminder.cron_expression else "Rescheduled"
+        return f"{prefix} \"{reminder.label}\" to {time_str}"
 
     return "Unknown item type."
 
@@ -384,7 +368,7 @@ def execute_cancel(db: Session, payload: dict) -> str:
     matched_id = payload["matched_id"]
     matched_type = payload["matched_type"]
 
-    if matched_type == "reminder":
+    if matched_type in ("reminder", "recurring"):
         reminder = db.query(Reminder).filter(
             Reminder.id == matched_id,
             Reminder.status.in_(["pending", "sent"]),
@@ -403,42 +387,18 @@ def execute_cancel(db: Session, payload: dict) -> str:
         log.info("Cancelled reminder #%d: %s", reminder.id, reminder.label)
         return f"Cancelled: \"{reminder.label}\""
 
-    elif matched_type == "recurring":
-        schedule = db.query(RecurringSchedule).filter(
-            RecurringSchedule.id == matched_id,
-            RecurringSchedule.status == "active",
-        ).first()
-        if not schedule:
-            return "That recurring schedule no longer exists."
-        schedule.status = "deleted"
-        db.commit()
-        log.info("Cancelled recurring #%d: %s", schedule.id, schedule.label)
-        return f"Cancelled recurring: \"{schedule.label}\""
-
     elif matched_type == "nag":
         nag = db.query(NagSchedule).filter(
             NagSchedule.id == matched_id,
             NagSchedule.status == "active",
         ).first()
         if not nag:
-            return "That nag schedule no longer exists."
+            return "That nag no longer exists."
         nag.status = "deleted"
+        nag.completed_at = datetime.now(timezone.utc)
         db.commit()
         log.info("Cancelled nag #%d: %s", nag.id, nag.label)
-        return f"Cancelled nag: \"{nag.label}\""
-
-    elif matched_type == "action":
-        item = db.query(ActionItem).filter(
-            ActionItem.id == matched_id,
-            ActionItem.status == "pending",
-        ).first()
-        if not item:
-            return "That action item no longer exists."
-        item.status = "done"
-        item.completed_at = datetime.now(timezone.utc)
-        db.commit()
-        log.info("Cancelled action item #%d: %s", item.id, item.description)
-        return f"Cancelled: \"{item.description}\""
+        return f"Cancelled: \"{nag.label}\""
 
     return "Unknown item type."
 
@@ -458,7 +418,7 @@ def execute_acknowledge(db: Session, payload: dict) -> str:
             NagSchedule.status == "active",
         ).first()
         if not nag:
-            return "That nag schedule no longer exists."
+            return "That nag no longer exists."
         if nag.repeating:
             nag.active_since = None
             nag.nag_until = None
@@ -469,6 +429,7 @@ def execute_acknowledge(db: Session, payload: dict) -> str:
             return f"Got it! \"{nag.label}\" done. Next cycle: {_format_time(nag.next_nag_at)}"
         else:
             nag.status = "deleted"
+            nag.completed_at = now
             db.commit()
             log.info("Acknowledged nag #%d (one-time, now deleted): %s", nag.id, nag.label)
             return f"Got it! \"{nag.label}\" done."
@@ -491,19 +452,6 @@ def execute_acknowledge(db: Session, payload: dict) -> str:
         db.commit()
         log.info("Dismissed reminder #%d: %s", reminder.id, reminder.label)
         return f"Dismissed: \"{reminder.label}\""
-
-    elif matched_type == "action":
-        item = db.query(ActionItem).filter(
-            ActionItem.id == matched_id,
-            ActionItem.status == "pending",
-        ).first()
-        if not item:
-            return "That action item no longer exists."
-        item.status = "done"
-        item.completed_at = now
-        db.commit()
-        log.info("Acknowledged action item #%d: %s", item.id, item.description)
-        return f"Done: \"{item.description}\""
 
     return "Unknown item type."
 
@@ -528,6 +476,7 @@ def execute_acknowledge_all(db: Session, payload: dict) -> str:
             nag.next_nag_at = _next_nag_cycle(nag, now)
         else:
             nag.status = "deleted"
+            nag.completed_at = now
 
     reminders = db.query(Reminder).filter(
         Reminder.user_phone == USER_PHONE,
@@ -536,42 +485,10 @@ def execute_acknowledge_all(db: Session, payload: dict) -> str:
     for r in reminders:
         r.status = "dismissed"
 
-    items = db.query(ActionItem).filter(
-        ActionItem.user_phone == USER_PHONE,
-        ActionItem.status == "pending",
-    ).all()
-    for item in items:
-        item.status = "done"
-        item.completed_at = now
-
     db.commit()
-    total = len(active_nags) + len(reminders) + len(items)
-    log.info("Acknowledged all: %d nags, %d reminders, %d actions", len(active_nags), len(reminders), len(items))
+    total = len(active_nags) + len(reminders)
+    log.info("Acknowledged all: %d nags, %d reminders", len(active_nags), len(reminders))
     return f"Cleared all! Marked {total} items as done/dismissed."
-
-
-def _handle_create_recurring(db: Session, data: dict) -> str:
-    label = data.get("label", "Recurring message")
-    cron_expr = data.get("cron_expression", "")
-    message_prompt = data.get("message_prompt", label)
-
-    if not cron_expr:
-        return "I couldn't figure out the schedule. Try something like 'every day at 5pm'?"
-
-    next_fire = _next_cron_fire(cron_expr, USER_TIMEZONE)
-    schedule = RecurringSchedule(
-        user_phone=USER_PHONE,
-        label=label,
-        message_prompt=message_prompt,
-        cron_expression=cron_expr,
-        timezone=USER_TIMEZONE,
-        next_fire_at=next_fire,
-        status="active",
-    )
-    db.add(schedule)
-    db.commit()
-
-    return f"Recurring schedule created: \"{label}\" (cron: {cron_expr}). Next: {_format_time(next_fire)}"
 
 
 def _handle_create_nag(db: Session, data: dict) -> str:
@@ -666,12 +583,8 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
             Reminder.user_phone == USER_PHONE,
             Reminder.status.in_(["pending", "sent"]),
         ).all()
-        items = db.query(ActionItem).filter(
-            ActionItem.user_phone == USER_PHONE,
-            ActionItem.status == "pending",
-        ).all()
 
-        total = len(active_nags) + len(reminders) + len(items)
+        total = len(active_nags) + len(reminders)
         if total == 0:
             return "Nothing pending to mark as done!"
 
@@ -683,7 +596,7 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
             payload=_json.dumps({}),
         ))
         db.commit()
-        return f"Clear ALL {total} items ({len(active_nags)} nag(s), {len(reminders)} reminder(s), {len(items)} action(s))? Reply YES to confirm."
+        return f"Clear ALL {total} items ({len(active_nags)} nag(s), {len(reminders)} reminder(s))? Reply YES to confirm."
 
     # Check if the raw message has meaningful keywords even if the parser didn't extract one
     raw_message = data.get("_raw_message", "")
@@ -727,22 +640,6 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
             db.commit()
             return f"Dismiss \"{reminder.label}\"? Reply YES to confirm."
 
-        item = db.query(ActionItem).filter(
-            ActionItem.user_phone == USER_PHONE,
-            ActionItem.status == "pending",
-        ).order_by(ActionItem.next_remind_at.asc()).first()
-
-        if item:
-            payload = {"matched_id": item.id, "matched_type": "action", "label": item.description}
-            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
-            db.add(PendingConfirmation(
-                user_phone=USER_PHONE,
-                action_type="acknowledge",
-                payload=_json.dumps(payload),
-            ))
-            db.commit()
-            return f"Mark \"{item.description}\" as done? Reply YES to confirm."
-
         return "Nothing pending to mark as done!"
 
     # Keyword provided — gather all acknowledgeable items and GPT fuzzy match
@@ -766,14 +663,6 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
         ack_items.append({"id": r.id, "type": "reminder", "label": r.label,
                           "detail": f"fires {_format_time(r.fire_at)} [{r.status}]",
                           "message": r.message})
-
-    for a in db.query(ActionItem).filter(
-        ActionItem.user_phone == USER_PHONE,
-        ActionItem.status == "pending",
-    ).order_by(ActionItem.created_at.desc()).all():
-        ack_items.append({"id": a.id, "type": "action", "label": a.description,
-                          "detail": f"source: {a.source}" if a.source else "",
-                          "message": a.source_ref or a.description})
 
     if not ack_items:
         return "Nothing pending to mark as done!"
@@ -825,25 +714,18 @@ def _handle_cancel(db: Session, data: dict) -> str:
     # Gather all cancellable items
     items = []
 
-    if target_type in (None, "reminder"):
+    if target_type in (None, "reminder", "recurring"):
         for r in db.query(Reminder).filter(
             Reminder.user_phone == USER_PHONE,
             Reminder.status.in_(["pending", "sent"]),
         ).order_by(Reminder.created_at.desc()).all():
-            items.append({"id": r.id, "type": "reminder", "label": r.label,
-                          "detail": f"fires {_format_time(r.fire_at)}",
+            rtype = "recurring" if r.cron_expression else "reminder"
+            detail = f"({r.cron_expression}) next: {_format_time(r.fire_at)}" if r.cron_expression else f"fires {_format_time(r.fire_at)}"
+            items.append({"id": r.id, "type": rtype, "label": r.label,
+                          "detail": detail,
                           "message": r.message})
 
-    if target_type in (None, "recurring"):
-        for s in db.query(RecurringSchedule).filter(
-            RecurringSchedule.user_phone == USER_PHONE,
-            RecurringSchedule.status == "active",
-        ).order_by(RecurringSchedule.created_at.desc()).all():
-            items.append({"id": s.id, "type": "recurring", "label": s.label,
-                          "detail": f"schedule: {s.cron_expression}, next: {_format_time(s.next_fire_at)}",
-                          "message": s.message_prompt})
-
-    if target_type in (None, "nag"):
+    if target_type in (None, "nag", "action"):
         for n in db.query(NagSchedule).filter(
             NagSchedule.user_phone == USER_PHONE,
             NagSchedule.status == "active",
@@ -852,15 +734,6 @@ def _handle_cancel(db: Session, data: dict) -> str:
             items.append({"id": n.id, "type": "nag", "label": n.label,
                           "detail": f"every {n.interval_minutes}min [{state}], next: {_format_time(n.next_nag_at)}",
                           "message": n.message})
-
-    if target_type in (None, "action"):
-        for a in db.query(ActionItem).filter(
-            ActionItem.user_phone == USER_PHONE,
-            ActionItem.status == "pending",
-        ).order_by(ActionItem.created_at.desc()).all():
-            items.append({"id": a.id, "type": "action", "label": a.description,
-                          "detail": f"source: {a.source}" if a.source else "",
-                          "message": a.source_ref or a.description})
 
     if not items:
         return "Nothing to cancel!"
@@ -917,29 +790,14 @@ def _handle_snooze(db: Session, data: dict) -> str:
     nq = db.query(NagSchedule).filter(
         NagSchedule.user_phone == USER_PHONE,
         NagSchedule.status == "active",
-        NagSchedule.active_since.isnot(None),
     )
     if keyword:
         nq = nq.filter(NagSchedule.label.ilike(f"%{keyword}%"))
-    nag = nq.first()
+    nag = nq.order_by(NagSchedule.next_nag_at.asc()).first()
     if nag:
         nag.next_nag_at = snooze_until
         db.commit()
-        return f"Snoozed nag \"{nag.label}\" for {duration} minutes."
-
-    query = db.query(ActionItem).filter(
-        ActionItem.user_phone == USER_PHONE,
-        ActionItem.status == "pending",
-    )
-    if keyword:
-        query = query.filter(ActionItem.description.ilike(f"%{keyword}%"))
-
-    item = query.order_by(ActionItem.next_remind_at.asc()).first()
-    if item:
-        item.snooze_until = snooze_until
-        item.next_remind_at = snooze_until
-        db.commit()
-        return f"Snoozed \"{item.description}\" for {duration} minutes."
+        return f"Snoozed \"{nag.label}\" for {duration} minutes."
 
     # Try reminders
     rq = db.query(Reminder).filter(
@@ -966,29 +824,16 @@ def _handle_list(db: Session, data: dict) -> str:
         Reminder.user_phone == USER_PHONE,
         Reminder.status.in_(["pending", "sent"]),
     ).order_by(Reminder.fire_at.asc()).all()
-    if reminders:
+    one_shot = [r for r in reminders if not r.cron_expression]
+    recurring = [r for r in reminders if r.cron_expression]
+    if one_shot:
         lines.append("REMINDERS:")
-        for r in reminders:
+        for r in one_shot:
             lines.append(f"  - {r.label} @ {_format_time(r.fire_at)} [{r.status}]")
-
-    items = db.query(ActionItem).filter(
-        ActionItem.user_phone == USER_PHONE,
-        ActionItem.status == "pending",
-    ).order_by(ActionItem.next_remind_at.asc()).all()
-    if items:
-        lines.append("ACTION ITEMS:")
-        for item in items:
-            src = f" ({item.source})" if item.source else ""
-            lines.append(f"  - {item.description}{src}")
-
-    recurring = db.query(RecurringSchedule).filter(
-        RecurringSchedule.user_phone == USER_PHONE,
-        RecurringSchedule.status == "active",
-    ).order_by(RecurringSchedule.next_fire_at.asc()).all()
     if recurring:
         lines.append("RECURRING:")
-        for s in recurring:
-            lines.append(f"  - {s.label} (next: {_format_time(s.next_fire_at)})")
+        for r in recurring:
+            lines.append(f"  - {r.label} ({r.cron_expression}) next: {_format_time(r.fire_at)}")
 
     nags = db.query(NagSchedule).filter(
         NagSchedule.user_phone == USER_PHONE,
@@ -999,7 +844,8 @@ def _handle_list(db: Session, data: dict) -> str:
         for n in nags:
             state = "ACTIVE" if n.active_since else "waiting"
             recurrence = f" ({n.recurrence_description})" if n.recurrence_description else ""
-            lines.append(f"  - {n.label} every {n.interval_minutes}min{recurrence} [{state}] (next: {_format_time(n.next_nag_at)})")
+            src = f" [from: {n.source}]" if n.source else ""
+            lines.append(f"  - {n.label} every {n.interval_minutes}min{recurrence} [{state}]{src} (next: {_format_time(n.next_nag_at)})")
 
     if not lines:
         return "All clear! Nothing pending."
@@ -1107,7 +953,7 @@ def _handle_help(db: Session, data: dict) -> str:
     return (
         "SMS ADHD Assistant commands:\n"
         "- Set a reminder: \"meeting at 4pm friday about X\"\n"
-        "- Recurring: \"remind me to exercise every day at 5pm\"\n"
+        "- Recurring reminder: \"remind me about Dr Watson every Tuesday at 3pm\"\n"
         "- Nag: \"nag me to enter my time at 9am every 15 min weekdays\"\n"
         "- Mark done: \"done\" or \"done [keyword]\"\n"
         "- Clear all: \"done all\"\n"

@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.database import engine, Base, SessionLocal
-from app.models import Reminder, RecurringSchedule, ActionItem, NagSchedule, ExerciseLog
+from app.models import Reminder, NagSchedule, ExerciseLog
 from app.config import USER_TIMEZONE
 
 app = FastAPI(title="ADHD Bot UI")
@@ -50,7 +50,7 @@ def _render_page(body: str) -> HTMLResponse:
 </head>
 <body>
 <h1>ADHD Bot</h1>
-<nav><a href="/">Reminders</a> <a href="/recurring">Recurring</a> <a href="/actions">Action Items</a> <a href="/nags">Nags</a> <a href="/exercise">Exercise</a></nav>
+<nav><a href="/">Reminders</a> <a href="/nags">Nags</a> <a href="/exercise">Exercise</a></nav>
 {body}
 </body>
 </html>"""
@@ -67,10 +67,12 @@ def reminders_page():
 
         trs = ""
         for r in rows:
+            cron = r.cron_expression or "-"
             trs += f"""<tr>
               <td>{r.id}</td>
               <td>{r.label}</td>
               <td>{r.message[:80]}</td>
+              <td>{cron}</td>
               <td>{_fmt(r.fire_at)}</td>
               <td class="status-{r.status}">{r.status}</td>
               <td>{_fmt(r.sent_at)}</td>
@@ -80,7 +82,7 @@ def reminders_page():
             </tr>"""
 
         cleanup_btn = ""
-        done_count = sum(1 for r in rows if r.status in ("dismissed", "cancelled", "sent"))
+        done_count = sum(1 for r in rows if r.status in ("dismissed", "cancelled", "sent") and not r.cron_expression)
         if done_count:
             cleanup_btn = f"""<form method="post" action="/delete/reminders/completed" style="margin:0;display:inline">
               <button class="btn-cleanup" onclick="return confirm('Delete {done_count} completed/cancelled/sent reminders?')">Delete all completed/cancelled ({done_count})</button>
@@ -88,84 +90,7 @@ def reminders_page():
 
         table = f"""<h2>Reminders ({len(rows)})</h2>
         {cleanup_btn}
-        <table><tr><th>ID</th><th>Label</th><th>Message</th><th>Fire At</th><th>Status</th><th>Sent</th><th></th></tr>
-        {trs}</table>"""
-        return _render_page(table)
-    finally:
-        db.close()
-
-
-@app.get("/recurring", response_class=HTMLResponse)
-def recurring_page():
-    db = SessionLocal()
-    try:
-        rows = db.query(RecurringSchedule).order_by(RecurringSchedule.next_fire_at.desc()).all()
-        if not rows:
-            return _render_page("<h2>Recurring Schedules</h2><p class='empty'>None.</p>")
-
-        trs = ""
-        for r in rows:
-            trs += f"""<tr>
-              <td>{r.id}</td>
-              <td>{r.label}</td>
-              <td>{r.cron_expression}</td>
-              <td>{_fmt(r.next_fire_at)}</td>
-              <td class="status-{r.status}">{r.status}</td>
-              <td><form method="post" action="/delete/recurring/{r.id}" style="margin:0">
-                <button class="btn" onclick="return confirm('Delete?')">del</button>
-              </form></td>
-            </tr>"""
-
-        cleanup_btn = ""
-        done_count = sum(1 for r in rows if r.status == "deleted")
-        if done_count:
-            cleanup_btn = f"""<form method="post" action="/delete/recurring/completed" style="margin:0;display:inline">
-              <button class="btn-cleanup" onclick="return confirm('Delete {done_count} cancelled recurring schedules?')">Delete all cancelled ({done_count})</button>
-            </form>"""
-
-        table = f"""<h2>Recurring Schedules ({len(rows)})</h2>
-        {cleanup_btn}
-        <table><tr><th>ID</th><th>Label</th><th>Cron</th><th>Next Fire</th><th>Status</th><th></th></tr>
-        {trs}</table>"""
-        return _render_page(table)
-    finally:
-        db.close()
-
-
-@app.get("/actions", response_class=HTMLResponse)
-def actions_page():
-    db = SessionLocal()
-    try:
-        rows = db.query(ActionItem).filter(
-            ActionItem.status != "archived"
-        ).order_by(ActionItem.created_at.desc()).all()
-        if not rows:
-            return _render_page("<h2>Action Items</h2><p class='empty'>None.</p>")
-
-        trs = ""
-        for r in rows:
-            trs += f"""<tr>
-              <td>{r.id}</td>
-              <td>{r.description[:80]}</td>
-              <td>{r.source}</td>
-              <td class="status-{r.status}">{r.status}</td>
-              <td>{r.remind_count}</td>
-              <td>{_fmt(r.next_remind_at)}</td>
-              <td><form method="post" action="/delete/action/{r.id}" style="margin:0">
-                <button class="btn" onclick="return confirm('Delete?')">del</button>
-              </form></td>
-            </tr>"""
-
-        cleanup_btn = ""
-        done_count = sum(1 for r in rows if r.status == "done")
-        if done_count:
-            cleanup_btn = f"""<form method="post" action="/delete/actions/completed" style="margin:0;display:inline">
-              <button class="btn-cleanup" onclick="return confirm('Delete {done_count} completed action items?')">Delete all completed ({done_count})</button>
-            </form>"""
-
-        table = f"""<h2>Action Items ({len(rows)})</h2>
-        {cleanup_btn}
-        <table><tr><th>ID</th><th>Description</th><th>Source</th><th>Status</th><th>Nags</th><th>Next Remind</th><th></th></tr>
+        <table><tr><th>ID</th><th>Label</th><th>Message</th><th>Cron</th><th>Next Fire</th><th>Status</th><th>Sent</th><th></th></tr>
         {trs}</table>"""
         return _render_page(table)
     finally:
@@ -183,63 +108,19 @@ def delete_reminder(id: int):
     return RedirectResponse("/", status_code=303)
 
 
-@app.post("/delete/recurring/{id}")
-def delete_recurring(id: int):
-    db = SessionLocal()
-    try:
-        db.query(RecurringSchedule).filter(RecurringSchedule.id == id).delete()
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/recurring", status_code=303)
-
-
-@app.post("/delete/action/{id}")
-def delete_action(id: int):
-    db = SessionLocal()
-    try:
-        item = db.query(ActionItem).filter(ActionItem.id == id).first()
-        if item:
-            item.status = "archived"
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/actions", status_code=303)
-
-
 @app.post("/delete/reminders/completed")
 def delete_completed_reminders():
     db = SessionLocal()
     try:
-        db.query(Reminder).filter(Reminder.status.in_(("dismissed", "cancelled", "sent"))).delete(synchronize_session=False)
+        # Only clean up non-recurring sent/dismissed/cancelled reminders
+        db.query(Reminder).filter(
+            Reminder.status.in_(("dismissed", "cancelled", "sent")),
+            Reminder.cron_expression == None,
+        ).delete(synchronize_session=False)
         db.commit()
     finally:
         db.close()
     return RedirectResponse("/", status_code=303)
-
-
-@app.post("/delete/recurring/completed")
-def delete_completed_recurring():
-    db = SessionLocal()
-    try:
-        db.query(RecurringSchedule).filter(RecurringSchedule.status == "deleted").delete(synchronize_session=False)
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/recurring", status_code=303)
-
-
-@app.post("/delete/actions/completed")
-def delete_completed_actions():
-    db = SessionLocal()
-    try:
-        db.query(ActionItem).filter(ActionItem.status == "done").update(
-            {"status": "archived"}, synchronize_session=False
-        )
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/actions", status_code=303)
 
 
 @app.get("/nags", response_class=HTMLResponse)
@@ -259,9 +140,11 @@ def nags_page():
                 period = f"{r.cycle_months}mo" if r.cycle_months else f"{r.cycle_days}d"
                 anchor = f"&#x2693; {period}"
             repeating = r.recurrence_description if r.recurrence_description else ("Yes" if r.repeating else "No")
+            source = r.source or "-"
             trs += f"""<tr>
               <td>{r.id}</td>
               <td>{r.label}</td>
+              <td>{source}</td>
               <td>{r.cron_expression}</td>
               <td>{r.interval_minutes}m</td>
               <td>{dur}</td>
@@ -282,9 +165,9 @@ def nags_page():
               <button class="btn-cleanup" onclick="return confirm('Delete {done_count} cancelled nag schedules?')">Delete all cancelled ({done_count})</button>
             </form>"""
 
-        table = f"""<h2>Nag Schedules ({len(rows)})</h2>
+        table = f"""<h2>Nags ({len(rows)})</h2>
         {cleanup_btn}
-        <table><tr><th>ID</th><th>Label</th><th>Cron</th><th>Interval</th><th>Duration</th><th>Repeating</th><th>Next Nag</th><th>Status</th><th>Active</th><th>Anchor</th><th></th></tr>
+        <table><tr><th>ID</th><th>Label</th><th>Source</th><th>Cron</th><th>Interval</th><th>Duration</th><th>Repeating</th><th>Next Nag</th><th>Status</th><th>Active</th><th>Anchor</th><th></th></tr>
         {trs}</table>"""
         return _render_page(table)
     finally:

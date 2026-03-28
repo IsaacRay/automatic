@@ -1,4 +1,4 @@
-"""Background scheduler — fires reminders, recurring messages, and action item nags."""
+"""Background scheduler — fires reminders, nags, and scheduled messages."""
 
 import logging
 import threading
@@ -9,15 +9,14 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 
 from app.database import engine, Base, SessionLocal
-from app.models import Reminder, RecurringSchedule, ActionItem, NagSchedule, SmsLog, AppState
+from app.models import Reminder, NagSchedule, SmsLog, AppState, ProcessedEmail
 from app.config import (
     USER_PHONE, USER_TIMEZONE, TICK_SECONDS, GMAIL_SYNC_INTERVAL,
     BASEMENT_LIGHT_ON, BASEMENT_LIGHT_OFF, BRIEFING_TIME,
     EXERCISE_MORNING_TIME, EXERCISE_EVENING_TIME,
 )
 from app.twilio_client import send_sms
-from app.openai_client import generate_recurring_message
-from app.intent_router import _next_cron_fire, _next_nag_cycle, _backoff_delta
+from app.intent_router import _next_cron_fire, _next_nag_cycle
 from app.morning_briefing import generate_morning_briefing
 from app.exercise_motivation import generate_exercise_morning_message, generate_exercise_evening_message
 
@@ -82,7 +81,7 @@ def _log_outbound(db, body: str, sid: str, related_type: str = None, related_id:
 
 
 def fire_due_reminders(db):
-    """Send SMS for all reminders whose fire_at has passed."""
+    """Send SMS for all reminders whose fire_at has passed. Recurring reminders reschedule themselves."""
     now = datetime.now(timezone.utc)
     reminders = db.query(Reminder).filter(
         Reminder.status == "pending",
@@ -92,65 +91,25 @@ def fire_due_reminders(db):
     for r in reminders:
         try:
             result = send_sms(r.user_phone, r.message)
-            r.status = "sent"
             r.sent_at = now
             _log_outbound(db, r.message, result.get("sid", ""), "reminder", r.id)
+
+            if r.cron_expression:
+                # Recurring reminder — reschedule for next fire
+                tz = r.timezone or USER_TIMEZONE
+                r.fire_at = _next_cron_fire(r.cron_expression, tz)
+                r.status = "pending"
+                log.info("Fired recurring reminder #%d: %s (next: %s)", r.id, r.label, r.fire_at)
+            else:
+                # One-shot reminder
+                r.status = "sent"
+                log.info("Fired reminder #%d: %s", r.id, r.label)
+                if _is_event_time_reminder(db, r):
+                    _flash_basement_light()
+
             db.commit()
-            log.info("Fired reminder #%d: %s", r.id, r.label)
-            if _is_event_time_reminder(db, r):
-                _flash_basement_light()
         except Exception:
             log.exception("Failed to fire reminder #%d", r.id)
-            db.rollback()
-
-
-def fire_due_recurring(db):
-    """Generate and send messages for due recurring schedules."""
-    now = datetime.now(timezone.utc)
-    schedules = db.query(RecurringSchedule).filter(
-        RecurringSchedule.status == "active",
-        RecurringSchedule.next_fire_at <= now,
-    ).with_for_update(skip_locked=True).all()
-
-    for s in schedules:
-        try:
-            message = generate_recurring_message(s.message_prompt)
-            result = send_sms(s.user_phone, message)
-            s.next_fire_at = _next_cron_fire(s.cron_expression, s.timezone)
-            _log_outbound(db, message, result.get("sid", ""), "recurring", s.id)
-            db.commit()
-            log.info("Fired recurring #%d: %s", s.id, s.label)
-        except Exception:
-            log.exception("Failed to fire recurring #%d", s.id)
-            db.rollback()
-
-
-def fire_action_item_nags(db):
-    """Send re-reminders for pending action items."""
-    now = datetime.now(timezone.utc)
-    items = db.query(ActionItem).filter(
-        ActionItem.status == "pending",
-        ActionItem.next_remind_at <= now,
-        # Respect snooze
-        (ActionItem.snooze_until == None) | (ActionItem.snooze_until <= now),
-    ).with_for_update(skip_locked=True).all()
-
-    for item in items:
-        try:
-            nag_num = item.remind_count + 1
-            msg = f"Reminder #{nag_num}: {item.description}"
-            if item.source_ref:
-                msg += f"\n(from: {item.source_ref})"
-            msg += "\nReply DONE to mark complete, SNOOZE to delay."
-
-            result = send_sms(item.user_phone, msg)
-            item.remind_count = nag_num
-            item.next_remind_at = now + _backoff_delta(nag_num)
-            _log_outbound(db, msg, result.get("sid", ""), "action_item", item.id)
-            db.commit()
-            log.info("Nagged action item #%d (count=%d)", item.id, nag_num)
-        except Exception:
-            log.exception("Failed to nag action item #%d", item.id)
             db.rollback()
 
 
@@ -363,6 +322,21 @@ def main():
             conn.execute(text(
                 "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS recurrence_description VARCHAR(200)"
             ))
+            conn.execute(text(
+                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS source VARCHAR(50)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS source_ref TEXT"
+            ))
+            conn.execute(text(
+                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ"
+            ))
+            conn.execute(text(
+                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS cron_expression VARCHAR(100)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS timezone VARCHAR(50) DEFAULT 'America/New_York'"
+            ))
             conn.commit()
         except Exception:
             log.info("Column migration skipped (already exists)")
@@ -395,8 +369,6 @@ def main():
             fire_exercise_morning(db)
             fire_exercise_evening(db)
             fire_due_reminders(db)
-            fire_due_recurring(db)
-            fire_action_item_nags(db)
             fire_due_nags(db)
         except Exception:
             log.exception("Scheduler tick error")

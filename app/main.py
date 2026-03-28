@@ -10,8 +10,10 @@ from app.database import engine, Base, SessionLocal
 from app.models import SmsLog, PendingConfirmation
 from app.config import USER_PHONE
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent, execute_reschedule, execute_cancel, execute_acknowledge, execute_acknowledge_all
+from app.intent_router import handle_intent, execute_reschedule, execute_cancel, execute_acknowledge, execute_acknowledge_all, _handle_create_nag
 from app.twilio_client import send_sms
+
+KATHRYN_PHONE = "+19739787648"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -38,12 +40,59 @@ async def incoming_sms(
     Body: str = Form(...),
     MessageSid: str = Form(default=""),
 ):
+    # Auto-create nag from special number
+    if From == KATHRYN_PHONE:
+        log.info("Auto-nag SMS from %s: %s", From, Body[:100])
+        db = SessionLocal()
+        try:
+            db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+            db.commit()
+            label = Body.strip()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            reply = _handle_create_nag(db, {
+                "label": label,
+                "message": f"Reminder: {label}",
+                "interval_minutes": 60,
+                "first_nag_at": now_iso,
+            })
+            # Send the first nag immediately to the user
+            send_sms(USER_PHONE, f"Reminder: {label}")
+            # Send confirmation to the 973 number
+            send_sms(KATHRYN_PHONE, f"Reminder created: \"{label}\" (every 60 min)")
+            db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=""))
+            db.commit()
+        except Exception:
+            log.exception("Error processing auto-nag SMS")
+            db.rollback()
+        finally:
+            db.close()
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
+
     # Only allow the configured user phone
     if From != USER_PHONE:
         log.warning("Rejected SMS from unauthorized number: %s", From)
         return Response(content=EMPTY_TWIML, media_type="application/xml")
 
     log.info("Inbound SMS from %s: %s", From, Body[:100])
+
+    # Relay message to Kathryn if prefixed with "kk"
+    stripped = Body.strip()
+    if stripped[:2].lower() == "kk":
+        relay_body = stripped[2:].strip()
+        if relay_body:
+            db = SessionLocal()
+            try:
+                db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+                result = send_sms(KATHRYN_PHONE, relay_body)
+                db.add(SmsLog(direction="outbound", phone=KATHRYN_PHONE, body=relay_body, twilio_sid=result.get("sid", "")))
+                db.commit()
+                log.info("Relayed message to %s: %s", KATHRYN_PHONE, relay_body[:80])
+            except Exception:
+                log.exception("Error relaying kk message")
+                db.rollback()
+            finally:
+                db.close()
+            return Response(content=EMPTY_TWIML, media_type="application/xml")
 
     db = SessionLocal()
     try:

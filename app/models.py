@@ -19,39 +19,11 @@ class Reminder(Base):
     fire_at = Column(DateTime(timezone=True), nullable=False, index=True)
     message = Column(Text, nullable=False)
     parent_event_id = Column(String(64), nullable=True)
+    cron_expression = Column(String(100), nullable=True)
+    timezone = Column(String(50), nullable=True, default="America/New_York")
     status = Column(String(20), nullable=False, default="pending")
     sent_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-
-
-class RecurringSchedule(Base):
-    __tablename__ = "recurring_schedules"
-
-    id = Column(Integer, primary_key=True)
-    user_phone = Column(String(20), nullable=False, index=True)
-    label = Column(Text, nullable=False)
-    message_prompt = Column(Text, nullable=False)
-    cron_expression = Column(String(100), nullable=False)
-    timezone = Column(String(50), nullable=False, default="America/New_York")
-    next_fire_at = Column(DateTime(timezone=True), nullable=False, index=True)
-    status = Column(String(20), nullable=False, default="active")
-    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-
-
-class ActionItem(Base):
-    __tablename__ = "action_items"
-
-    id = Column(Integer, primary_key=True)
-    user_phone = Column(String(20), nullable=False, index=True)
-    source = Column(String(50), nullable=False)
-    source_ref = Column(Text, nullable=True)
-    description = Column(Text, nullable=False)
-    status = Column(String(20), nullable=False, default="pending")
-    remind_count = Column(Integer, nullable=False, default=0)
-    next_remind_at = Column(DateTime(timezone=True), nullable=True, index=True)
-    snooze_until = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-    completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class PendingConfirmation(Base):
@@ -89,8 +61,21 @@ class NagSchedule(Base):
     cycle_months = Column(Integer, nullable=True)
     cycle_days = Column(Integer, nullable=True)
     recurrence_description = Column(String(200), nullable=True)
+    source = Column(String(50), nullable=True)
+    source_ref = Column(Text, nullable=True)
     status = Column(String(20), nullable=False, default="active")
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ProcessedEmail(Base):
+    __tablename__ = "processed_emails"
+
+    id = Column(Integer, primary_key=True)
+    message_id = Column(String(255), nullable=False, unique=True, index=True)
+    subject = Column(Text, nullable=True)
+    date = Column(String(100), nullable=True)
+    processed_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 class AppState(Base):
