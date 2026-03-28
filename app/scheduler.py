@@ -406,6 +406,10 @@ def main():
             conn.execute(text(
                 "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS timezone VARCHAR(50) DEFAULT 'America/New_York'"
             ))
+            # Data migration: update legacy 60-min nags to 120-min
+            conn.execute(text(
+                "UPDATE nag_schedules SET interval_minutes = 120 WHERE interval_minutes = 60 AND status = 'active' AND deadline_at IS NULL"
+            ))
             conn.commit()
         except Exception:
             log.info("Column migration skipped (already exists)")
