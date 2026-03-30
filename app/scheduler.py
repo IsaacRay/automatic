@@ -126,9 +126,9 @@ def _is_quiet_hours(tz_name):
 
 
 def _compute_deadline_interval(nag, now):
-    """Compute dynamic interval using Zeno's paradox: always half the remaining time.
+    """Compute dynamic interval using Zeno's paradox: interval = 2/3 of remaining time.
 
-    1 hour out → wait 30 min → wait 15 min → wait 7.5 min → ... → clamp to min_interval.
+    9 days out → wait 6 days → wait 4 days → wait 2.67 days → ... → clamp to min_interval.
     Past deadline: clamp to min_interval.
     """
     min_iv = nag.min_interval_minutes or DEFAULT_MIN_INTERVAL
@@ -137,7 +137,7 @@ def _compute_deadline_interval(nag, now):
         return min_iv
 
     remaining_minutes = (nag.deadline_at - now).total_seconds() / 60.0
-    interval = remaining_minutes / 2.0
+    interval = remaining_minutes * 2.0 / 3.0
     return max(min_iv, int(round(interval)))
 
 
