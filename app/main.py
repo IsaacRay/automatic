@@ -10,7 +10,7 @@ from app.database import engine, Base, SessionLocal
 from app.models import SmsLog, PendingConfirmation
 from app.config import USER_PHONE
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent, execute_reschedule, execute_cancel, execute_acknowledge, execute_acknowledge_all, _handle_create_nag
+from app.intent_router import handle_intent, execute_reschedule, execute_cancel, execute_acknowledge, execute_acknowledge_all, execute_snooze, _handle_create_nag
 from app.twilio_client import send_sms
 
 KATHRYN_PHONE = "+19739787648"
@@ -130,6 +130,8 @@ async def incoming_sms(
                     reply = execute_acknowledge(db, payload)
                 elif action_type == "acknowledge_all":
                     reply = execute_acknowledge_all(db, payload)
+                elif action_type == "snooze":
+                    reply = execute_snooze(db, payload)
                 else:
                     reply = "Unknown confirmation type."
                 log.info("Confirmation accepted: %s", action_type)

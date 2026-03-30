@@ -99,6 +99,11 @@ _CANCEL_STOP_WORDS = frozenset({
     "get", "rid", "of", "that", "about",
 })
 
+_SNOOZE_STOP_WORDS = frozenset({
+    "snooze", "later", "not", "now", "remind", "me", "delay", "pause",
+    "the", "my", "a", "an", "is", "it", "i", "for", "to", "that", "about",
+})
+
 
 def _keyword_prefilter(search_text: str, items: list[dict], stop_words: frozenset) -> dict | None:
     """Match items by keyword overlap in label/message before resorting to GPT.
@@ -804,40 +809,153 @@ def _handle_cancel(db: Session, data: dict) -> str:
 
 
 def _handle_snooze(db: Session, data: dict) -> str:
+    import json as _json
+    import logging
+    from app.openai_client import deduce_acknowledge_target
+
+    log = logging.getLogger(__name__)
+
     duration = min(data.get("duration_minutes", 60), 1440)  # cap at 24 hours
     keyword = data.get("keyword")
+    raw_message = data.get("_raw_message", "")
+    now = datetime.now(timezone.utc)
+
+    # Extract keywords from raw message if parser missed them
+    raw_keywords = [w.lower() for w in raw_message.split() if w.lower() not in _SNOOZE_STOP_WORDS and len(w) > 1]
+    if not keyword and raw_keywords:
+        keyword = " ".join(raw_keywords)
+
+    # No keyword — pick most recent active nag, then pending reminder
+    if not keyword:
+        nag = db.query(NagSchedule).filter(
+            NagSchedule.user_phone == USER_PHONE,
+            NagSchedule.status == "active",
+            NagSchedule.active_since.isnot(None),
+        ).order_by(NagSchedule.next_nag_at.asc()).first()
+
+        if nag:
+            payload = {"matched_id": nag.id, "matched_type": "nag", "label": nag.label, "duration_minutes": duration}
+            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
+            db.add(PendingConfirmation(
+                user_phone=USER_PHONE,
+                action_type="snooze",
+                payload=_json.dumps(payload),
+            ))
+            db.commit()
+            return f"Snooze \"{nag.label}\" for {duration} min? Reply YES to confirm."
+
+        reminder = db.query(Reminder).filter(
+            Reminder.user_phone == USER_PHONE,
+            Reminder.status.in_(["pending", "sent"]),
+        ).order_by(Reminder.fire_at.asc()).first()
+
+        if reminder:
+            payload = {"matched_id": reminder.id, "matched_type": "reminder", "label": reminder.label, "duration_minutes": duration}
+            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
+            db.add(PendingConfirmation(
+                user_phone=USER_PHONE,
+                action_type="snooze",
+                payload=_json.dumps(payload),
+            ))
+            db.commit()
+            return f"Snooze \"{reminder.label}\" for {duration} min? Reply YES to confirm."
+
+        return "Nothing to snooze!"
+
+    # Keyword provided — gather all snoozeable items and match
+    items = []
+
+    for n in db.query(NagSchedule).filter(
+        NagSchedule.user_phone == USER_PHONE,
+        NagSchedule.status == "active",
+    ).all():
+        state = "ACTIVE" if n.active_since else "waiting"
+        items.append({"id": n.id, "type": "nag", "label": n.label,
+                       "detail": f"every {n.interval_minutes}min [{state}]",
+                       "message": n.message})
+
+    for r in db.query(Reminder).filter(
+        Reminder.user_phone == USER_PHONE,
+        Reminder.status.in_(["pending", "sent"]),
+    ).order_by(Reminder.fire_at.asc()).all():
+        items.append({"id": r.id, "type": "reminder", "label": r.label,
+                       "detail": f"fires {_format_time(r.fire_at)} [{r.status}]",
+                       "message": r.message})
+
+    if not items:
+        return "Nothing to snooze!"
+
+    original_message = data.get("_raw_message") or keyword
+
+    # Try fast keyword matching first — only call GPT if ambiguous
+    match = _keyword_prefilter(original_message, items, _SNOOZE_STOP_WORDS)
+    if not match:
+        result = deduce_acknowledge_target(original_message, items)
+        log.info("Snooze match result: %s", result)
+
+        if not result.get("matched_id"):
+            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+        try:
+            matched_id = int(result["matched_id"])
+        except (ValueError, TypeError):
+            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+        match = next((i for i in items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+        if not match:
+            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+    # Store confirmation
+    payload = {"matched_id": match["id"], "matched_type": match["type"], "label": match["label"], "duration_minutes": duration}
+
+    db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
+    db.add(PendingConfirmation(
+        user_phone=USER_PHONE,
+        action_type="snooze",
+        payload=_json.dumps(payload),
+    ))
+    db.commit()
+
+    return f"Snooze \"{match['label']}\" for {duration} min? Reply YES to confirm."
+
+
+def execute_snooze(db: Session, payload: dict) -> str:
+    """Execute a confirmed snooze action. Called after user replies YES."""
+    import logging
+    log = logging.getLogger(__name__)
+
+    matched_id = payload["matched_id"]
+    matched_type = payload["matched_type"]
+    duration = payload.get("duration_minutes", 60)
     now = datetime.now(timezone.utc)
     snooze_until = now + timedelta(minutes=duration)
 
-    # Check active nags first
-    nq = db.query(NagSchedule).filter(
-        NagSchedule.user_phone == USER_PHONE,
-        NagSchedule.status == "active",
-    )
-    if keyword:
-        nq = nq.filter(NagSchedule.label.ilike(f"%{keyword}%"))
-    nag = nq.order_by(NagSchedule.next_nag_at.asc()).first()
-    if nag:
+    if matched_type == "nag":
+        nag = db.query(NagSchedule).filter(
+            NagSchedule.id == matched_id,
+            NagSchedule.status == "active",
+        ).first()
+        if not nag:
+            return "That nag no longer exists."
         nag.next_nag_at = snooze_until
         db.commit()
-        return f"Snoozed \"{nag.label}\" for {duration} minutes."
+        log.info("Snoozed nag #%d for %d min: %s", nag.id, duration, nag.label)
+        return f"Snoozed \"{nag.label}\" for {duration} min."
 
-    # Try reminders
-    rq = db.query(Reminder).filter(
-        Reminder.user_phone == USER_PHONE,
-        Reminder.status.in_(["pending", "sent"]),
-    )
-    if keyword:
-        rq = rq.filter(Reminder.label.ilike(f"%{keyword}%"))
-
-    reminder = rq.order_by(Reminder.fire_at.asc()).first()
-    if reminder:
+    elif matched_type == "reminder":
+        reminder = db.query(Reminder).filter(
+            Reminder.id == matched_id,
+            Reminder.status.in_(["pending", "sent"]),
+        ).first()
+        if not reminder:
+            return "That reminder no longer exists."
         reminder.fire_at = snooze_until
         reminder.status = "pending"
         db.commit()
-        return f"Snoozed \"{reminder.label}\" for {duration} minutes."
+        log.info("Snoozed reminder #%d for %d min: %s", reminder.id, duration, reminder.label)
+        return f"Snoozed \"{reminder.label}\" for {duration} min."
 
-    return "Nothing to snooze!"
+    return "Unknown item type."
 
 
 def _handle_list(db: Session, data: dict) -> str:
