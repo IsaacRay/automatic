@@ -105,6 +105,34 @@ _SNOOZE_STOP_WORDS = frozenset({
 })
 
 
+def _parse_snooze_duration(text: str) -> int:
+    """Parse a snooze duration from raw message text. Returns minutes, default 60."""
+    import re
+    t = text.lower()
+    # "1440 minutes", "30 min", "2 hours", "1 hour", "1 day", etc.
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(min(?:ute)?s?|hrs?|hours?|days?)', t)
+    if m:
+        val = float(m.group(1))
+        unit = m.group(2)
+        if unit.startswith("h"):
+            return int(val * 60)
+        elif unit.startswith("d"):
+            return int(val * 1440)
+        else:
+            return int(val)
+    # "half hour", "half a day" — check before "a day"/"an hour"
+    if re.search(r'\bhalf\s+(an?\s+)?hour\b', t):
+        return 30
+    if re.search(r'\bhalf\s+(a\s+)?day\b', t):
+        return 720
+    # "a day", "a hour"
+    if re.search(r'\ba\s+day\b', t):
+        return 1440
+    if re.search(r'\ban?\s+hour\b', t):
+        return 60
+    return 60
+
+
 def _keyword_prefilter(search_text: str, items: list[dict], stop_words: frozenset) -> dict | None:
     """Match items by keyword overlap in label/message before resorting to GPT.
 
@@ -811,13 +839,20 @@ def _handle_cancel(db: Session, data: dict) -> str:
 def _handle_snooze(db: Session, data: dict) -> str:
     import json as _json
     import logging
+    import re
     from app.openai_client import deduce_acknowledge_target
 
     log = logging.getLogger(__name__)
 
-    duration = min(data.get("duration_minutes", 60), 1440)  # cap at 24 hours
-    keyword = data.get("keyword")
+    duration = data.get("duration_minutes")
     raw_message = data.get("_raw_message", "")
+
+    # Fallback: parse duration from raw message if GPT missed it
+    if not duration:
+        duration = _parse_snooze_duration(raw_message)
+    duration = min(duration, 1440)  # cap at 24 hours
+
+    keyword = data.get("keyword")
     now = datetime.now(timezone.utc)
 
     # Extract keywords from raw message if parser missed them
