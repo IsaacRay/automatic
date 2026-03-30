@@ -804,7 +804,7 @@ def _handle_cancel(db: Session, data: dict) -> str:
 
 
 def _handle_snooze(db: Session, data: dict) -> str:
-    duration = data.get("duration_minutes", 60)
+    duration = min(data.get("duration_minutes", 60), 1440)  # cap at 24 hours
     keyword = data.get("keyword")
     now = datetime.now(timezone.utc)
     snooze_until = now + timedelta(minutes=duration)

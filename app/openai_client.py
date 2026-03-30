@@ -108,8 +108,8 @@ Use this intent when the user wants to get rid of something they no longer need 
 - "new_time": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC)
 - "original_message": the user's original message text verbatim (needed for fuzzy matching)
 
-**snooze**: The user wants to delay reminders. Trigger words: "snooze", "later", "not now", "remind me later".
-- "duration_minutes": how long to snooze (default 60)
+**snooze**: The user wants to delay reminders or nags. Trigger words: "snooze", "later", "not now", "remind me later".
+- "duration_minutes": how long to snooze in minutes (default 60). Convert natural language durations: "a day"=1440, "an hour"=60, "2 hours"=120, "30 min"=30, "a week"=10080. Maximum 1440 (24 hours).
 - "keyword": optional keyword to match a specific item
 
 **list**: The user wants to see their pending items. Trigger words: "list", "show", "what do I have", "status", "pending".
