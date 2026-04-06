@@ -118,6 +118,24 @@ async def incoming_sms(request: Request):
             db.close()
         return Response(content=EMPTY_TWIML, media_type="application/xml")
 
+    # Anyone can send photos for the slideshow — save MMS images regardless of sender
+    saved_count = _save_mms_images(dict(form_data))
+    if saved_count > 0:
+        photo_reply = f"{'Photo' if saved_count == 1 else f'{saved_count} photos'} saved!"
+        send_sms(From, photo_reply)
+        db = SessionLocal()
+        try:
+            db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+            db.add(SmsLog(direction="outbound", phone=From, body=photo_reply, twilio_sid=""))
+            db.commit()
+        except Exception:
+            log.exception("Error logging slideshow MMS")
+            db.rollback()
+        finally:
+            db.close()
+        # Ignore any text body — just save the photos
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
+
     # Only allow the configured user phone
     if From != USER_PHONE:
         log.warning("Rejected SMS from unauthorized number: %s", From)
@@ -154,18 +172,6 @@ async def incoming_sms(request: Request):
             twilio_sid=MessageSid,
         ))
         db.commit()
-
-        # Handle MMS images
-        saved_count = _save_mms_images(dict(form_data))
-        if saved_count > 0:
-            photo_reply = f"{'Photo' if saved_count == 1 else f'{saved_count} photos'} saved!"
-            send_sms(USER_PHONE, photo_reply)
-            db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=photo_reply, twilio_sid=""))
-            db.commit()
-
-        # If image-only MMS with no text, we're done
-        if not Body.strip():
-            return Response(content=EMPTY_TWIML, media_type="application/xml")
 
         # Check for pending confirmation before parsing intent
         now = datetime.now(timezone.utc)

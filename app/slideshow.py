@@ -91,16 +91,25 @@ def slideshow_page():
   const placeholder = document.getElementById('placeholder');
   const counter = document.getElementById('counter');
 
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
   async function loadPhotos() {
     const resp = await fetch('/api/photos');
-    photos = await resp.json();
-    if (photos.length === 0) {
+    const fetched = await resp.json();
+    if (fetched.length === 0) {
       placeholder.style.display = 'block';
       counter.textContent = '';
       return;
     }
     placeholder.style.display = 'none';
-    if (currentIndex >= photos.length) currentIndex = 0;
+    photos = shuffle(fetched);
+    currentIndex = 0;
     showPhoto(currentIndex);
   }
 
