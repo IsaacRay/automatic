@@ -27,6 +27,8 @@ CMD ["sh", "-c", "\
     python -m app.scheduler; \
   elif [ \"$APP_MODE\" = \"ui\" ]; then \
     python -m app.ui; \
+  elif [ \"$APP_MODE\" = \"slideshow\" ]; then \
+    python -m app.slideshow; \
   else \
     uvicorn app.main:app --host 0.0.0.0 --port 8000; \
   fi \

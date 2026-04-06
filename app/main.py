@@ -2,16 +2,21 @@
 
 import json
 import logging
+import os
+import uuid
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Form, Response
+import requests as http_requests
+from fastapi import FastAPI, Form, Request, Response
 
 from app.database import engine, Base, SessionLocal
 from app.models import SmsLog, PendingConfirmation
-from app.config import USER_PHONE
+from app.config import USER_PHONE, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 from app.openai_client import parse_user_sms
 from app.intent_router import handle_intent, undo_reschedule, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag
 from app.twilio_client import send_sms
+
+PHOTOS_DIR = "/app/photos"
 
 KATHRYN_PHONE = "+19739787648"
 
@@ -34,12 +39,57 @@ def health():
     return {"status": "ok"}
 
 
+def _save_mms_images(form_data: dict) -> int:
+    """Download MMS media attachments and save to PHOTOS_DIR. Returns count saved."""
+    num_media = int(form_data.get("NumMedia", "0"))
+    if num_media == 0:
+        return 0
+
+    os.makedirs(PHOTOS_DIR, exist_ok=True)
+    saved = 0
+
+    for i in range(num_media):
+        media_url = form_data.get(f"MediaUrl{i}")
+        content_type = form_data.get(f"MediaContentType{i}", "")
+
+        if not media_url or not content_type.startswith("image/"):
+            continue
+
+        ext_map = {
+            "image/jpeg": ".jpg", "image/png": ".png",
+            "image/gif": ".gif", "image/webp": ".webp",
+        }
+        ext = ext_map.get(content_type, ".jpg")
+
+        try:
+            resp = http_requests.get(
+                media_url,
+                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                timeout=30,
+            )
+            resp.raise_for_status()
+
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            filename = f"{timestamp}_{uuid.uuid4().hex[:8]}{ext}"
+            filepath = os.path.join(PHOTOS_DIR, filename)
+
+            with open(filepath, "wb") as f:
+                f.write(resp.content)
+
+            saved += 1
+            log.info("Saved MMS image: %s (%s, %d bytes)", filename, content_type, len(resp.content))
+        except Exception:
+            log.exception("Failed to download MMS media: %s", media_url)
+
+    return saved
+
+
 @app.post("/sms")
-async def incoming_sms(
-    From: str = Form(...),
-    Body: str = Form(...),
-    MessageSid: str = Form(default=""),
-):
+async def incoming_sms(request: Request):
+    form_data = await request.form()
+    From = form_data.get("From", "")
+    Body = form_data.get("Body", "")
+    MessageSid = form_data.get("MessageSid", "")
     # Auto-create nag from special number
     if From == KATHRYN_PHONE:
         log.info("Auto-nag SMS from %s: %s", From, Body[:100])
@@ -104,6 +154,18 @@ async def incoming_sms(
             twilio_sid=MessageSid,
         ))
         db.commit()
+
+        # Handle MMS images
+        saved_count = _save_mms_images(dict(form_data))
+        if saved_count > 0:
+            photo_reply = f"{'Photo' if saved_count == 1 else f'{saved_count} photos'} saved!"
+            send_sms(USER_PHONE, photo_reply)
+            db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=photo_reply, twilio_sid=""))
+            db.commit()
+
+        # If image-only MMS with no text, we're done
+        if not Body.strip():
+            return Response(content=EMPTY_TWIML, media_type="application/xml")
 
         # Check for pending confirmation before parsing intent
         now = datetime.now(timezone.utc)
