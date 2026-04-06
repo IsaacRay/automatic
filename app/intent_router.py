@@ -299,39 +299,31 @@ def _handle_reschedule(db: Session, data: dict) -> str:
         log.warning("Invalid matched_id from GPT: %s", result.get("matched_id"))
         return "Couldn't figure out what to reschedule. Text LIST to see your items."
 
-    # Build confirmation payload and store it
+    # Capture previous state for undo before executing
     payload = {
         "matched_id": matched_id,
         "matched_type": result["matched_type"],
         "new_time": result["new_time"],
         "description": result.get("description", ""),
     }
+    undo_state = _capture_reschedule_undo(db, matched_id, result["matched_type"])
 
-    # Delete any existing pending confirmations for this user
+    # Execute immediately
+    reply = execute_reschedule(db, payload)
+
+    # Store undo confirmation
+    undo_payload = {**payload, "undo_state": undo_state}
     db.query(PendingConfirmation).filter(
         PendingConfirmation.user_phone == USER_PHONE,
     ).delete()
-
-    confirmation = PendingConfirmation(
+    db.add(PendingConfirmation(
         user_phone=USER_PHONE,
-        action_type="reschedule",
-        payload=_json.dumps(payload),
-    )
-    db.add(confirmation)
+        action_type="undo_reschedule",
+        payload=_json.dumps(undo_payload),
+    ))
     db.commit()
 
-    # Format the new time for display
-    new_event_time = _parse_dt(result["new_time"])
-    time_str = _format_time(new_event_time)
-
-    # Find the label of the matched item
-    label = result.get("description", payload["matched_type"])
-    for item in items:
-        if item["id"] == matched_id and item["type"] == result["matched_type"]:
-            label = item["label"]
-            break
-
-    return f"Reschedule \"{label}\" to {time_str}? Reply YES to confirm."
+    return f"{reply}. Reply UNDO to reverse."
 
 
 def execute_reschedule(db: Session, payload: dict) -> str:
@@ -393,6 +385,50 @@ def execute_reschedule(db: Session, payload: dict) -> str:
     return "Unknown item type."
 
 
+def _capture_reschedule_undo(db: Session, matched_id: int, matched_type: str) -> list[dict]:
+    """Capture the current state of reminder(s) before a reschedule, for undo."""
+    snapshots = []
+    if matched_type in ("reminder", "recurring"):
+        reminder = db.query(Reminder).filter(
+            Reminder.id == matched_id,
+            Reminder.status.in_(["pending", "sent"]),
+        ).first()
+        if not reminder:
+            return snapshots
+        if reminder.parent_event_id:
+            siblings = db.query(Reminder).filter(
+                Reminder.parent_event_id == reminder.parent_event_id,
+                Reminder.status != "cancelled",
+            ).all()
+            for s in siblings:
+                snapshots.append({
+                    "id": s.id, "fire_at": s.fire_at.isoformat(),
+                    "status": s.status, "message": s.message,
+                })
+        else:
+            snapshots.append({
+                "id": reminder.id, "fire_at": reminder.fire_at.isoformat(),
+                "status": reminder.status, "message": reminder.message,
+            })
+    return snapshots
+
+
+def undo_reschedule(db: Session, payload: dict) -> str:
+    """Reverse a reschedule by restoring previous fire_at/status/message."""
+    import logging
+    log = logging.getLogger(__name__)
+    for snap in payload.get("undo_state", []):
+        r = db.query(Reminder).filter(Reminder.id == snap["id"]).first()
+        if r:
+            r.fire_at = _parse_dt(snap["fire_at"])
+            r.status = snap["status"]
+            r.message = snap["message"]
+    db.commit()
+    label = payload.get("description") or "reminder"
+    log.info("Undid reschedule for: %s", label)
+    return f"Undone! \"{label}\" restored to its previous time."
+
+
 def execute_cancel(db: Session, payload: dict) -> str:
     """Execute a confirmed cancel action. Called after user replies YES."""
     import logging
@@ -436,8 +472,55 @@ def execute_cancel(db: Session, payload: dict) -> str:
     return "Unknown item type."
 
 
+def _capture_cancel_undo(db: Session, matched_id: int, matched_type: str) -> dict:
+    """Capture current state before a cancel, for undo."""
+    if matched_type in ("reminder", "recurring"):
+        reminder = db.query(Reminder).filter(Reminder.id == matched_id).first()
+        if not reminder:
+            return {}
+        if reminder.parent_event_id:
+            siblings = db.query(Reminder).filter(
+                Reminder.parent_event_id == reminder.parent_event_id,
+                Reminder.status.in_(["pending", "sent"]),
+            ).all()
+            return {"items": [{"id": s.id, "prev_status": s.status} for s in siblings]}
+        return {"items": [{"id": reminder.id, "prev_status": reminder.status}]}
+    elif matched_type == "nag":
+        nag = db.query(NagSchedule).filter(NagSchedule.id == matched_id).first()
+        if not nag:
+            return {}
+        return {"nag_id": nag.id, "prev_status": nag.status,
+                "prev_completed_at": nag.completed_at.isoformat() if nag.completed_at else None}
+    return {}
+
+
+def undo_cancel(db: Session, payload: dict) -> str:
+    """Reverse a cancel by restoring previous statuses."""
+    import logging
+    log = logging.getLogger(__name__)
+    undo = payload.get("undo_state", {})
+    label = payload.get("label", "item")
+
+    # Undo reminder cancellation
+    for item in undo.get("items", []):
+        r = db.query(Reminder).filter(Reminder.id == item["id"]).first()
+        if r:
+            r.status = item["prev_status"]
+
+    # Undo nag cancellation
+    if "nag_id" in undo:
+        nag = db.query(NagSchedule).filter(NagSchedule.id == undo["nag_id"]).first()
+        if nag:
+            nag.status = undo["prev_status"]
+            nag.completed_at = _parse_dt(undo["prev_completed_at"]) if undo.get("prev_completed_at") else None
+
+    db.commit()
+    log.info("Undid cancel for: %s", label)
+    return f"Undone! \"{label}\" has been restored."
+
+
 def execute_acknowledge(db: Session, payload: dict) -> str:
-    """Execute a confirmed acknowledge action. Called after user replies YES."""
+    """Execute an acknowledge action."""
     import logging
     log = logging.getLogger(__name__)
 
@@ -522,6 +605,117 @@ def execute_acknowledge_all(db: Session, payload: dict) -> str:
     total = len(active_nags) + len(reminders)
     log.info("Acknowledged all: %d nags, %d reminders", len(active_nags), len(reminders))
     return f"Cleared all! Marked {total} items as done/dismissed."
+
+
+def _capture_acknowledge_undo(db: Session, matched_id: int, matched_type: str) -> dict:
+    """Capture current state before an acknowledge, for undo."""
+    if matched_type == "nag":
+        nag = db.query(NagSchedule).filter(NagSchedule.id == matched_id).first()
+        if not nag:
+            return {}
+        return {
+            "nag_id": nag.id, "repeating": nag.repeating,
+            "prev_status": nag.status,
+            "prev_active_since": nag.active_since.isoformat() if nag.active_since else None,
+            "prev_nag_until": nag.nag_until.isoformat() if nag.nag_until else None,
+            "prev_nag_count": nag.nag_count,
+            "prev_next_nag_at": nag.next_nag_at.isoformat() if nag.next_nag_at else None,
+            "prev_completed_at": nag.completed_at.isoformat() if nag.completed_at else None,
+        }
+    elif matched_type == "reminder":
+        reminder = db.query(Reminder).filter(Reminder.id == matched_id).first()
+        if not reminder:
+            return {}
+        if reminder.parent_event_id:
+            siblings = db.query(Reminder).filter(
+                Reminder.parent_event_id == reminder.parent_event_id,
+                Reminder.status.in_(["pending", "sent"]),
+            ).all()
+            return {"items": [{"id": s.id, "prev_status": s.status} for s in siblings]}
+        return {"items": [{"id": reminder.id, "prev_status": reminder.status}]}
+    return {}
+
+
+def undo_acknowledge(db: Session, payload: dict) -> str:
+    """Reverse an acknowledge by restoring previous state."""
+    import logging
+    log = logging.getLogger(__name__)
+    undo = payload.get("undo_state", {})
+    label = payload.get("label", "item")
+
+    if "nag_id" in undo:
+        nag = db.query(NagSchedule).filter(NagSchedule.id == undo["nag_id"]).first()
+        if nag:
+            nag.status = undo["prev_status"]
+            nag.active_since = _parse_dt(undo["prev_active_since"]) if undo.get("prev_active_since") else None
+            nag.nag_until = _parse_dt(undo["prev_nag_until"]) if undo.get("prev_nag_until") else None
+            nag.nag_count = undo.get("prev_nag_count", 0)
+            nag.next_nag_at = _parse_dt(undo["prev_next_nag_at"]) if undo.get("prev_next_nag_at") else None
+            nag.completed_at = _parse_dt(undo["prev_completed_at"]) if undo.get("prev_completed_at") else None
+
+    for item in undo.get("items", []):
+        r = db.query(Reminder).filter(Reminder.id == item["id"]).first()
+        if r:
+            r.status = item["prev_status"]
+
+    db.commit()
+    log.info("Undid acknowledge for: %s", label)
+    return f"Undone! \"{label}\" restored."
+
+
+def _capture_acknowledge_all_undo(db: Session) -> dict:
+    """Capture state of all items before acknowledge-all, for undo."""
+    nags = []
+    for n in db.query(NagSchedule).filter(
+        NagSchedule.user_phone == USER_PHONE,
+        NagSchedule.status == "active",
+        NagSchedule.active_since.isnot(None),
+    ).all():
+        nags.append({
+            "id": n.id, "repeating": n.repeating,
+            "prev_status": n.status,
+            "prev_active_since": n.active_since.isoformat() if n.active_since else None,
+            "prev_nag_until": n.nag_until.isoformat() if n.nag_until else None,
+            "prev_nag_count": n.nag_count,
+            "prev_next_nag_at": n.next_nag_at.isoformat() if n.next_nag_at else None,
+            "prev_completed_at": n.completed_at.isoformat() if n.completed_at else None,
+        })
+
+    reminders = []
+    for r in db.query(Reminder).filter(
+        Reminder.user_phone == USER_PHONE,
+        Reminder.status.in_(["pending", "sent"]),
+    ).all():
+        reminders.append({"id": r.id, "prev_status": r.status})
+
+    return {"nags": nags, "reminders": reminders}
+
+
+def undo_acknowledge_all(db: Session, payload: dict) -> str:
+    """Reverse an acknowledge-all by restoring all previous states."""
+    import logging
+    log = logging.getLogger(__name__)
+    undo = payload.get("undo_state", {})
+
+    for snap in undo.get("nags", []):
+        nag = db.query(NagSchedule).filter(NagSchedule.id == snap["id"]).first()
+        if nag:
+            nag.status = snap["prev_status"]
+            nag.active_since = _parse_dt(snap["prev_active_since"]) if snap.get("prev_active_since") else None
+            nag.nag_until = _parse_dt(snap["prev_nag_until"]) if snap.get("prev_nag_until") else None
+            nag.nag_count = snap.get("prev_nag_count", 0)
+            nag.next_nag_at = _parse_dt(snap["prev_next_nag_at"]) if snap.get("prev_next_nag_at") else None
+            nag.completed_at = _parse_dt(snap["prev_completed_at"]) if snap.get("prev_completed_at") else None
+
+    for snap in undo.get("reminders", []):
+        r = db.query(Reminder).filter(Reminder.id == snap["id"]).first()
+        if r:
+            r.status = snap["prev_status"]
+
+    db.commit()
+    total = len(undo.get("nags", [])) + len(undo.get("reminders", []))
+    log.info("Undid acknowledge-all: %d items restored", total)
+    return f"Undone! Restored {total} items."
 
 
 def _handle_create_nag(db: Session, data: dict) -> str:
@@ -629,39 +823,29 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
     now = datetime.now(timezone.utc)
 
     if ack_all:
-        # Count how many items would be cleared
-        active_nags = db.query(NagSchedule).filter(
-            NagSchedule.user_phone == USER_PHONE,
-            NagSchedule.status == "active",
-            NagSchedule.active_since.isnot(None),
-        ).all()
-        reminders = db.query(Reminder).filter(
-            Reminder.user_phone == USER_PHONE,
-            Reminder.status.in_(["pending", "sent"]),
-        ).all()
-
-        total = len(active_nags) + len(reminders)
-        if total == 0:
+        # Capture undo state for all items before executing
+        undo_state = _capture_acknowledge_all_undo(db)
+        if not undo_state["nags"] and not undo_state["reminders"]:
             return "Nothing pending to mark as done!"
 
-        # Store confirmation
+        reply = execute_acknowledge_all(db, {})
+
         db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
         db.add(PendingConfirmation(
             user_phone=USER_PHONE,
-            action_type="acknowledge_all",
-            payload=_json.dumps({}),
+            action_type="undo_acknowledge_all",
+            payload=_json.dumps({"undo_state": undo_state}),
         ))
         db.commit()
-        return f"Clear ALL {total} items ({len(active_nags)} nag(s), {len(reminders)} reminder(s))? Reply YES to confirm."
+        return f"{reply} Reply UNDO to reverse."
 
     # Check if the raw message has meaningful keywords even if the parser didn't extract one
     raw_message = data.get("_raw_message", "")
     raw_keywords = [w.lower() for w in raw_message.split() if w.lower() not in _ACK_STOP_WORDS and len(w) > 1]
     if not keyword and raw_keywords:
-        # Parser missed the keyword but the message has useful words — treat as keyword search
         keyword = " ".join(raw_keywords)
 
-    # No keyword — pick most recent active nag, then sent reminder, then action item
+    # No keyword — pick most recent active nag, then sent reminder
     if not keyword:
         nag = db.query(NagSchedule).filter(
             NagSchedule.user_phone == USER_PHONE,
@@ -670,91 +854,75 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
         ).order_by(NagSchedule.next_nag_at.asc()).first()
 
         if nag:
-            payload = {"matched_id": nag.id, "matched_type": "nag", "label": nag.label}
-            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
-            db.add(PendingConfirmation(
-                user_phone=USER_PHONE,
-                action_type="acknowledge",
-                payload=_json.dumps(payload),
-            ))
-            db.commit()
-            return f"Mark \"{nag.label}\" as done? Reply YES to confirm."
+            match = {"id": nag.id, "type": "nag", "label": nag.label}
+        else:
+            reminder = db.query(Reminder).filter(
+                Reminder.user_phone == USER_PHONE,
+                Reminder.status == "sent",
+            ).order_by(Reminder.sent_at.desc()).first()
 
-        reminder = db.query(Reminder).filter(
+            if reminder:
+                match = {"id": reminder.id, "type": "reminder", "label": reminder.label}
+            else:
+                return "Nothing pending to mark as done!"
+    else:
+        # Keyword provided — gather all acknowledgeable items and GPT fuzzy match
+        ack_items = []
+
+        for n in db.query(NagSchedule).filter(
+            NagSchedule.user_phone == USER_PHONE,
+            NagSchedule.status == "active",
+        ).all():
+            state = "ACTIVE" if n.active_since else "waiting"
+            ack_items.append({"id": n.id, "type": "nag", "label": n.label,
+                              "detail": f"every {n.interval_minutes}min [{state}]",
+                              "message": n.message})
+
+        for r in db.query(Reminder).filter(
             Reminder.user_phone == USER_PHONE,
-            Reminder.status == "sent",
-        ).order_by(Reminder.sent_at.desc()).first()
+            Reminder.status.in_(["pending", "sent"]),
+        ).order_by(Reminder.created_at.desc()).all():
+            ack_items.append({"id": r.id, "type": "reminder", "label": r.label,
+                              "detail": f"fires {_format_time(r.fire_at)} [{r.status}]",
+                              "message": r.message})
 
-        if reminder:
-            payload = {"matched_id": reminder.id, "matched_type": "reminder", "label": reminder.label}
-            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
-            db.add(PendingConfirmation(
-                user_phone=USER_PHONE,
-                action_type="acknowledge",
-                payload=_json.dumps(payload),
-            ))
-            db.commit()
-            return f"Dismiss \"{reminder.label}\"? Reply YES to confirm."
+        if not ack_items:
+            return "Nothing pending to mark as done!"
 
-        return "Nothing pending to mark as done!"
+        original_message = data.get("_raw_message") or keyword
 
-    # Keyword provided — gather all acknowledgeable items and GPT fuzzy match
-    ack_items = []
-
-    # Include ALL active nags (not just currently-nagging ones) so the user
-    # can mark a nag done even if it's between cycles / hasn't started yet.
-    for n in db.query(NagSchedule).filter(
-        NagSchedule.user_phone == USER_PHONE,
-        NagSchedule.status == "active",
-    ).all():
-        state = "ACTIVE" if n.active_since else "waiting"
-        ack_items.append({"id": n.id, "type": "nag", "label": n.label,
-                          "detail": f"every {n.interval_minutes}min [{state}]",
-                          "message": n.message})
-
-    for r in db.query(Reminder).filter(
-        Reminder.user_phone == USER_PHONE,
-        Reminder.status.in_(["pending", "sent"]),
-    ).order_by(Reminder.created_at.desc()).all():
-        ack_items.append({"id": r.id, "type": "reminder", "label": r.label,
-                          "detail": f"fires {_format_time(r.fire_at)} [{r.status}]",
-                          "message": r.message})
-
-    if not ack_items:
-        return "Nothing pending to mark as done!"
-
-    original_message = data.get("_raw_message") or keyword
-
-    # Try fast keyword matching first — only call GPT if ambiguous
-    match = _keyword_prefilter(original_message, ack_items, _ACK_STOP_WORDS)
-    if not match:
-        result = deduce_acknowledge_target(original_message, ack_items)
-        log.info("Acknowledge match result: %s", result)
-
-        if not result.get("matched_id"):
-            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
-
-        try:
-            matched_id = int(result["matched_id"])
-        except (ValueError, TypeError):
-            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
-
-        match = next((i for i in ack_items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+        match = _keyword_prefilter(original_message, ack_items, _ACK_STOP_WORDS)
         if not match:
-            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+            result = deduce_acknowledge_target(original_message, ack_items)
+            log.info("Acknowledge match result: %s", result)
 
-    # Store confirmation
+            if not result.get("matched_id"):
+                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+            try:
+                matched_id = int(result["matched_id"])
+            except (ValueError, TypeError):
+                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+            match = next((i for i in ack_items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+            if not match:
+                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+    # Execute immediately and store undo state
     payload = {"matched_id": match["id"], "matched_type": match["type"], "label": match["label"]}
+    undo_state = _capture_acknowledge_undo(db, match["id"], match["type"])
+    reply = execute_acknowledge(db, payload)
 
+    undo_payload = {**payload, "undo_state": undo_state}
     db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
     db.add(PendingConfirmation(
         user_phone=USER_PHONE,
-        action_type="acknowledge",
-        payload=_json.dumps(payload),
+        action_type="undo_acknowledge",
+        payload=_json.dumps(undo_payload),
     ))
     db.commit()
 
-    return f"Mark \"{match['label']}\" as done? Reply YES to confirm."
+    return f"{reply} Reply UNDO to reverse."
 
 
 def _handle_cancel(db: Session, data: dict) -> str:
@@ -822,18 +990,21 @@ def _handle_cancel(db: Session, data: dict) -> str:
             if not match:
                 return f"Couldn't find anything matching \"{keyword or original_message}\". Text LIST to see your items."
 
-    # Store confirmation
+    # Execute immediately and store undo state
     payload = {"matched_id": match["id"], "matched_type": match["type"], "label": match["label"]}
+    undo_state = _capture_cancel_undo(db, match["id"], match["type"])
+    reply = execute_cancel(db, payload)
 
+    undo_payload = {**payload, "undo_state": undo_state}
     db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
     db.add(PendingConfirmation(
         user_phone=USER_PHONE,
-        action_type="cancel",
-        payload=_json.dumps(payload),
+        action_type="undo_cancel",
+        payload=_json.dumps(undo_payload),
     ))
     db.commit()
 
-    return f"Cancel \"{match['label']}\"? Reply YES to confirm."
+    return f"{reply}. Reply UNDO to reverse."
 
 
 def _handle_snooze(db: Session, data: dict) -> str:
@@ -869,89 +1040,75 @@ def _handle_snooze(db: Session, data: dict) -> str:
         ).order_by(NagSchedule.next_nag_at.asc()).first()
 
         if nag:
-            payload = {"matched_id": nag.id, "matched_type": "nag", "label": nag.label, "duration_minutes": duration}
-            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
-            db.add(PendingConfirmation(
-                user_phone=USER_PHONE,
-                action_type="snooze",
-                payload=_json.dumps(payload),
-            ))
-            db.commit()
-            return f"Snooze \"{nag.label}\" for {duration} min? Reply YES to confirm."
+            match = {"id": nag.id, "type": "nag", "label": nag.label}
+        else:
+            reminder = db.query(Reminder).filter(
+                Reminder.user_phone == USER_PHONE,
+                Reminder.status.in_(["pending", "sent"]),
+            ).order_by(Reminder.fire_at.asc()).first()
 
-        reminder = db.query(Reminder).filter(
+            if reminder:
+                match = {"id": reminder.id, "type": "reminder", "label": reminder.label}
+            else:
+                return "Nothing to snooze!"
+    else:
+        # Keyword provided — gather all snoozeable items and match
+        items = []
+
+        for n in db.query(NagSchedule).filter(
+            NagSchedule.user_phone == USER_PHONE,
+            NagSchedule.status == "active",
+        ).all():
+            state = "ACTIVE" if n.active_since else "waiting"
+            items.append({"id": n.id, "type": "nag", "label": n.label,
+                           "detail": f"every {n.interval_minutes}min [{state}]",
+                           "message": n.message})
+
+        for r in db.query(Reminder).filter(
             Reminder.user_phone == USER_PHONE,
             Reminder.status.in_(["pending", "sent"]),
-        ).order_by(Reminder.fire_at.asc()).first()
+        ).order_by(Reminder.fire_at.asc()).all():
+            items.append({"id": r.id, "type": "reminder", "label": r.label,
+                           "detail": f"fires {_format_time(r.fire_at)} [{r.status}]",
+                           "message": r.message})
 
-        if reminder:
-            payload = {"matched_id": reminder.id, "matched_type": "reminder", "label": reminder.label, "duration_minutes": duration}
-            db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
-            db.add(PendingConfirmation(
-                user_phone=USER_PHONE,
-                action_type="snooze",
-                payload=_json.dumps(payload),
-            ))
-            db.commit()
-            return f"Snooze \"{reminder.label}\" for {duration} min? Reply YES to confirm."
+        if not items:
+            return "Nothing to snooze!"
 
-        return "Nothing to snooze!"
+        original_message = data.get("_raw_message") or keyword
 
-    # Keyword provided — gather all snoozeable items and match
-    items = []
-
-    for n in db.query(NagSchedule).filter(
-        NagSchedule.user_phone == USER_PHONE,
-        NagSchedule.status == "active",
-    ).all():
-        state = "ACTIVE" if n.active_since else "waiting"
-        items.append({"id": n.id, "type": "nag", "label": n.label,
-                       "detail": f"every {n.interval_minutes}min [{state}]",
-                       "message": n.message})
-
-    for r in db.query(Reminder).filter(
-        Reminder.user_phone == USER_PHONE,
-        Reminder.status.in_(["pending", "sent"]),
-    ).order_by(Reminder.fire_at.asc()).all():
-        items.append({"id": r.id, "type": "reminder", "label": r.label,
-                       "detail": f"fires {_format_time(r.fire_at)} [{r.status}]",
-                       "message": r.message})
-
-    if not items:
-        return "Nothing to snooze!"
-
-    original_message = data.get("_raw_message") or keyword
-
-    # Try fast keyword matching first — only call GPT if ambiguous
-    match = _keyword_prefilter(original_message, items, _SNOOZE_STOP_WORDS)
-    if not match:
-        result = deduce_acknowledge_target(original_message, items)
-        log.info("Snooze match result: %s", result)
-
-        if not result.get("matched_id"):
-            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
-
-        try:
-            matched_id = int(result["matched_id"])
-        except (ValueError, TypeError):
-            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
-
-        match = next((i for i in items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+        match = _keyword_prefilter(original_message, items, _SNOOZE_STOP_WORDS)
         if not match:
-            return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+            result = deduce_acknowledge_target(original_message, items)
+            log.info("Snooze match result: %s", result)
 
-    # Store confirmation
+            if not result.get("matched_id"):
+                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+            try:
+                matched_id = int(result["matched_id"])
+            except (ValueError, TypeError):
+                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+            match = next((i for i in items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
+            if not match:
+                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+
+    # Execute immediately and store undo state
     payload = {"matched_id": match["id"], "matched_type": match["type"], "label": match["label"], "duration_minutes": duration}
+    undo_state = _capture_snooze_undo(db, match["id"], match["type"])
+    reply = execute_snooze(db, payload)
 
+    undo_payload = {**payload, "undo_state": undo_state}
     db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
     db.add(PendingConfirmation(
         user_phone=USER_PHONE,
-        action_type="snooze",
-        payload=_json.dumps(payload),
+        action_type="undo_snooze",
+        payload=_json.dumps(undo_payload),
     ))
     db.commit()
 
-    return f"Snooze \"{match['label']}\" for {duration} min? Reply YES to confirm."
+    return f"{reply} Reply UNDO to reverse."
 
 
 def execute_snooze(db: Session, payload: dict) -> str:
@@ -991,6 +1148,42 @@ def execute_snooze(db: Session, payload: dict) -> str:
         return f"Snoozed \"{reminder.label}\" for {duration} min."
 
     return "Unknown item type."
+
+
+def _capture_snooze_undo(db: Session, matched_id: int, matched_type: str) -> dict:
+    """Capture current state before a snooze, for undo."""
+    if matched_type == "nag":
+        nag = db.query(NagSchedule).filter(NagSchedule.id == matched_id).first()
+        if nag:
+            return {"nag_id": nag.id, "prev_next_nag_at": nag.next_nag_at.isoformat() if nag.next_nag_at else None}
+    elif matched_type == "reminder":
+        r = db.query(Reminder).filter(Reminder.id == matched_id).first()
+        if r:
+            return {"reminder_id": r.id, "prev_fire_at": r.fire_at.isoformat(), "prev_status": r.status}
+    return {}
+
+
+def undo_snooze(db: Session, payload: dict) -> str:
+    """Reverse a snooze by restoring previous timing."""
+    import logging
+    log = logging.getLogger(__name__)
+    undo = payload.get("undo_state", {})
+    label = payload.get("label", "item")
+
+    if "nag_id" in undo:
+        nag = db.query(NagSchedule).filter(NagSchedule.id == undo["nag_id"]).first()
+        if nag and undo.get("prev_next_nag_at"):
+            nag.next_nag_at = _parse_dt(undo["prev_next_nag_at"])
+
+    if "reminder_id" in undo:
+        r = db.query(Reminder).filter(Reminder.id == undo["reminder_id"]).first()
+        if r:
+            r.fire_at = _parse_dt(undo["prev_fire_at"])
+            r.status = undo["prev_status"]
+
+    db.commit()
+    log.info("Undid snooze for: %s", label)
+    return f"Undone! \"{label}\" restored to its previous time."
 
 
 def _handle_list(db: Session, data: dict) -> str:

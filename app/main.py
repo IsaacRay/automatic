@@ -10,7 +10,7 @@ from app.database import engine, Base, SessionLocal
 from app.models import SmsLog, PendingConfirmation
 from app.config import USER_PHONE
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent, execute_reschedule, execute_cancel, execute_acknowledge, execute_acknowledge_all, execute_snooze, _handle_create_nag
+from app.intent_router import handle_intent, undo_reschedule, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag
 from app.twilio_client import send_sms
 
 KATHRYN_PHONE = "+19739787648"
@@ -114,45 +114,45 @@ async def incoming_sms(
 
         if pending:
             stripped = Body.strip().lower()
-            # Extract payload BEFORE deleting to avoid stale-object issues
-            payload = json.loads(pending.payload)
-            action_type = pending.action_type
+
+            if stripped.startswith("undo"):
+                # Extract payload BEFORE deleting to avoid stale-object issues
+                payload = json.loads(pending.payload)
+                action_type = pending.action_type
+                db.delete(pending)
+                db.commit()
+
+                # User wants to undo — dispatch to the appropriate undo function
+                undo_handlers = {
+                    "undo_reschedule": undo_reschedule,
+                    "undo_cancel": undo_cancel,
+                    "undo_acknowledge": undo_acknowledge,
+                    "undo_acknowledge_all": undo_acknowledge_all,
+                    "undo_snooze": undo_snooze,
+                }
+                handler = undo_handlers.get(action_type)
+                if handler:
+                    reply = handler(db, payload)
+                else:
+                    reply = "Nothing to undo."
+                log.info("Undo accepted: %s", action_type)
+
+                result = send_sms(USER_PHONE, reply)
+                sid = result.get("sid", "")
+                db.add(SmsLog(
+                    direction="outbound",
+                    phone=USER_PHONE,
+                    body=reply,
+                    twilio_sid=sid,
+                ))
+                db.commit()
+
+                return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+            # Not an undo — clear the pending confirmation and fall through
+            # to normal intent parsing so the new message is handled normally
             db.delete(pending)
             db.commit()
-
-            if stripped.startswith("y"):
-                # User confirmed — execute the action
-                if action_type == "reschedule":
-                    reply = execute_reschedule(db, payload)
-                elif action_type == "cancel":
-                    reply = execute_cancel(db, payload)
-                elif action_type == "acknowledge":
-                    reply = execute_acknowledge(db, payload)
-                elif action_type == "acknowledge_all":
-                    reply = execute_acknowledge_all(db, payload)
-                elif action_type == "snooze":
-                    reply = execute_snooze(db, payload)
-                else:
-                    reply = "Unknown confirmation type."
-                log.info("Confirmation accepted: %s", action_type)
-            else:
-                # User declined — let them know and invite retry
-                log.info("Confirmation declined for: %s", action_type)
-                label = payload.get("label") or payload.get("description", "that")
-                reply = f"OK, didn't {action_type} \"{label}\". Try again with more detail or text LIST to see your items."
-
-            # Send reply
-            result = send_sms(USER_PHONE, reply)
-            sid = result.get("sid", "")
-            db.add(SmsLog(
-                direction="outbound",
-                phone=USER_PHONE,
-                body=reply,
-                twilio_sid=sid,
-            ))
-            db.commit()
-
-            return Response(content=EMPTY_TWIML, media_type="application/xml")
 
         # Also clean up any expired confirmations
         db.query(PendingConfirmation).filter(
