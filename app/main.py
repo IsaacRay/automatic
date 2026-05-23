@@ -10,10 +10,10 @@ import requests as http_requests
 from fastapi import FastAPI, Form, Request, Response
 
 from app.database import SessionLocal
-from app.models import SmsLog, PendingConfirmation, DailyChecklistItem
+from app.models import SmsLog, PendingConfirmation, DailyChecklistItem, CheckList, CheckListItem
 from app.config import USER_PHONE, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent, undo_reschedule, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag
+from app.intent_router import handle_intent, undo_reschedule, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag, _handle_help
 from app.twilio_client import send_sms
 
 PHOTOS_DIR = "/app/photos"
@@ -143,6 +143,87 @@ async def incoming_sms(request: Request):
     log.info("Inbound SMS from %s: %s", From, Body[:100])
 
     stripped = Body.strip()
+
+    # Help text — "#help" prefix bypasses intent router because the carrier
+    # intercepts plain "HELP" and "INFO" before they reach the webhook.
+    if stripped.lower().startswith("#help"):
+        db = SessionLocal()
+        try:
+            db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+            reply = _handle_help(db, {})
+            result = send_sms(USER_PHONE, reply)
+            db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=result.get("sid", "")))
+            db.commit()
+        except Exception:
+            log.exception("Error sending help")
+            db.rollback()
+        finally:
+            db.close()
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+    # Create a new checklist if prefixed with "#newlist"
+    if stripped.lower().startswith("#newlist"):
+        remainder = stripped[len("#newlist"):]
+        lines = [ln.strip() for ln in remainder.splitlines()]
+        # First line (after #newlist on the same line) is the optional title
+        title = lines[0] if lines and lines[0] else ""
+        items = [ln for ln in lines[1:] if ln]
+        if not title:
+            from zoneinfo import ZoneInfo
+            from app.config import USER_TIMEZONE
+            title = "List " + datetime.now(ZoneInfo(USER_TIMEZONE)).strftime("%b %d %I:%M %p")
+
+        db = SessionLocal()
+        try:
+            db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+            now = datetime.now(timezone.utc)
+            lst = CheckList(title=title, created_at=now, activated_at=now)
+            db.add(lst)
+            db.flush()
+            for i, item in enumerate(items):
+                db.add(CheckListItem(checklist_id=lst.id, label=item, position=i))
+            db.commit()
+            reply = f'Created list "{title}" with {len(items)} item{"s" if len(items) != 1 else ""}.'
+            result = send_sms(USER_PHONE, reply)
+            db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=result.get("sid", "")))
+            db.commit()
+        except Exception:
+            log.exception("Error creating list")
+            db.rollback()
+        finally:
+            db.close()
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+    # Append items to the current list if prefixed with "#updatelist"
+    if stripped.lower().startswith("#updatelist"):
+        remainder = stripped[len("#updatelist"):]
+        new_items = [ln.strip() for ln in remainder.splitlines() if ln.strip()]
+        db = SessionLocal()
+        try:
+            db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+            current = db.query(CheckList).order_by(CheckList.activated_at.desc()).first()
+            if current is None:
+                reply = "No list to update. Text \"#newlist ...\" to create one."
+            elif not new_items:
+                reply = "No items to add. Put each item on its own line after #updatelist."
+            else:
+                max_pos = db.query(CheckListItem).filter(
+                    CheckListItem.checklist_id == current.id
+                ).order_by(CheckListItem.position.desc()).first()
+                start = (max_pos.position + 1) if max_pos else 0
+                for i, item in enumerate(new_items):
+                    db.add(CheckListItem(checklist_id=current.id, label=item, position=start + i))
+                db.commit()
+                reply = f'Added {len(new_items)} item{"s" if len(new_items) != 1 else ""} to "{current.title}".'
+            result = send_sms(USER_PHONE, reply)
+            db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=result.get("sid", "")))
+            db.commit()
+        except Exception:
+            log.exception("Error updating list")
+            db.rollback()
+        finally:
+            db.close()
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
 
     # Add to daily checklist if prefixed with "##"
     if stripped.startswith("##"):

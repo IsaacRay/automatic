@@ -132,8 +132,8 @@ Use this intent when the user wants to get rid of something they no longer need 
 **list**: The user wants to see their pending items. Trigger words: "list", "show", "what do I have", "status", "pending".
 No additional data needed.
 
-**help**: The user is asking what they can do or how the bot works. Trigger words: "commands", "info", "what can you do", "how does this work", "options", "menu".
-NOTE: The word "help" alone is reserved by the carrier and won't reach us — use the triggers above instead.
+**help**: The user is asking what they can do or how the bot works. Trigger words: "commands", "what can you do", "how does this work", "options", "menu".
+NOTE: "help" and "info" alone are reserved by the carrier and won't reach us. The canonical command is "#help" (handled in main.py before this parser runs), so don't expect to see it here.
 No additional data needed.
 
 **briefing**: The user wants their morning briefing (weather, calendar, market summary). Trigger words: "briefing", "morning briefing", "brief me", "what's my day look like", "daily briefing", "today's briefing".

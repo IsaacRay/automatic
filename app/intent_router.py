@@ -1408,5 +1408,11 @@ def _handle_help(db: Session, data: dict) -> str:
         "- Exercise history: \"what exercise did I do this week\"\n"
         "- Morning briefing: \"briefing\" or \"what's my day look like\"\n"
         "- See pending: \"list\"\n"
-        "- This message: \"commands\" or \"info\""
+        "- This message: \"commands\" or \"#help\"\n"
+        "Prefix shortcuts:\n"
+        "- #help — show this message (works around carrier blocking HELP/INFO)\n"
+        "- #newlist <title> then items on new lines — create a checklist\n"
+        "- #updatelist then items on new lines — append to current list\n"
+        "- ##<item> — add to today's daily checklist\n"
+        "- kk <message> — relay a message to Kathryn"
     )

@@ -125,7 +125,7 @@ On startup: sends recovery notification SMS, runs column migrations.
 | `briefing` | "briefing", "what's my day" | `_handle_briefing` |
 | `log_exercise` | "I ran", "I biked", "went for a walk" | `_handle_log_exercise` |
 | `exercise_history` | "exercise history", "my workouts" | `_handle_exercise_history` |
-| `help` | "commands", "info" | `_handle_help` |
+| `help` | "#help" (prefix, bypasses intent router), "commands" | `_handle_help` |
 
 ## Key Files
 

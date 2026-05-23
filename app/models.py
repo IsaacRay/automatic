@@ -113,6 +113,26 @@ class DailyChecklistItem(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
+class CheckList(Base):
+    __tablename__ = "checklists"
+
+    id = Column(Integer, primary_key=True)
+    title = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    activated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, index=True)
+
+
+class CheckListItem(Base):
+    __tablename__ = "checklist_items"
+
+    id = Column(Integer, primary_key=True)
+    checklist_id = Column(Integer, nullable=False, index=True)
+    label = Column(Text, nullable=False)
+    position = Column(Integer, nullable=False, default=0)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
 class SmsLog(Base):
     __tablename__ = "sms_log"
 

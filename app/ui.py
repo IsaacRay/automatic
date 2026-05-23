@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.database import engine, Base, SessionLocal
-from app.models import Reminder, NagSchedule, DailyChecklistItem
+from app.models import Reminder, NagSchedule, DailyChecklistItem, CheckList, CheckListItem
 from app.config import USER_TIMEZONE
 
 app = FastAPI(title="ADHD Bot UI")
@@ -58,7 +58,7 @@ def _render_page(body: str) -> HTMLResponse:
 </head>
 <body>
 <h1>ADHD Bot</h1>
-<nav><a href="/">Today</a> <a href="/reminders">Reminders</a> <a href="/nags">Nags</a></nav>
+<nav><a href="/">Lists</a> <a href="/today">Today</a> <a href="/reminders">Reminders</a> <a href="/nags">Nags</a></nav>
 {body}
 </body>
 </html>"""
@@ -79,7 +79,7 @@ def _is_done_today(item: DailyChecklistItem) -> bool:
     return item.completed_at.astimezone(ZoneInfo(USER_TIMEZONE)).date() == _local_today()
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/today", response_class=HTMLResponse)
 def checklist_page():
     db = SessionLocal()
     try:
@@ -122,7 +122,7 @@ def toggle_checklist(id: int):
             db.commit()
     finally:
         db.close()
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/today", status_code=303)
 
 
 @app.post("/checklist/delete/{id}")
@@ -131,6 +131,118 @@ def delete_checklist_item(id: int):
     try:
         db.query(DailyChecklistItem).filter(DailyChecklistItem.id == id).delete()
         db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/today", status_code=303)
+
+
+def _escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _render_list_block(lst: CheckList, items, heading_level: int = 2, show_resurrect: bool = False, collapsed: bool = False) -> str:
+    """Render a checklist as a Today-style block."""
+    title = _escape(lst.title)
+    h = f"h{heading_level}"
+    if not items:
+        body_inner = "<p class='empty'>No items.</p>"
+    else:
+        lis = ""
+        for it in items:
+            done = it.completed_at is not None
+            checked = "checked" if done else ""
+            done_class = "done" if done else ""
+            label = _escape(it.label)
+            lis += f"""<li class="{done_class}">
+              <form method="post" action="/lists/toggle/{it.id}">
+                <input type="checkbox" {checked} onchange="this.form.submit()">
+              </form>
+              <span class="label">{label}</span>
+            </li>"""
+        body_inner = f"<ul class='checklist'>{lis}</ul>"
+
+    actions = f"""<form method="post" action="/lists/delete/{lst.id}" style="margin:0;display:inline">
+      <button class="btn" onclick="return confirm('Delete this list?')">delete</button>
+    </form>"""
+    if show_resurrect:
+        actions = f"""<form method="post" action="/lists/resurrect/{lst.id}" style="margin:0;display:inline;margin-right:6px">
+          <button class="btn-cleanup">make current</button>
+        </form>""" + actions
+
+    created = _fmt(lst.created_at)
+    title_html = f"{title} <span style='color:#666;font-size:13px;font-weight:normal'>({created})</span>"
+    if collapsed:
+        return (
+            f"<details style='margin:8px 0'>"
+            f"<summary style='cursor:pointer;font-size:1.17em;font-weight:bold;padding:4px 0'>{title_html}</summary>"
+            f"{actions}{body_inner}"
+            f"</details>"
+        )
+    return f"<{h}>{title_html}</{h}>{actions}{body_inner}"
+
+
+@app.get("/", response_class=HTMLResponse)
+def lists_page():
+    db = SessionLocal()
+    try:
+        lists = db.query(CheckList).order_by(CheckList.activated_at.desc()).all()
+        hint = "<p class='hint'>Text \"#newlist &lt;title&gt;\\nitem1\\nitem2...\" to create a new list.</p>"
+        if not lists:
+            return _render_page(f"<h2>Lists</h2>{hint}<p class='empty'>No lists yet.</p>")
+
+        items_by_list = {}
+        for lst in lists:
+            items_by_list[lst.id] = db.query(CheckListItem).filter(
+                CheckListItem.checklist_id == lst.id
+            ).order_by(CheckListItem.position.asc(), CheckListItem.id.asc()).all()
+
+        current = lists[0]
+        body = f"<h2>Current List</h2>{hint}"
+        body += _render_list_block(current, items_by_list[current.id], heading_level=3, show_resurrect=False)
+
+        if len(lists) > 1:
+            body += "<h2>Previous Lists</h2>"
+            for lst in lists[1:]:
+                body += _render_list_block(lst, items_by_list[lst.id], heading_level=3, show_resurrect=True, collapsed=True)
+
+        return _render_page(body)
+    finally:
+        db.close()
+
+
+@app.post("/lists/toggle/{id}")
+def toggle_list_item(id: int):
+    db = SessionLocal()
+    try:
+        item = db.query(CheckListItem).filter(CheckListItem.id == id).first()
+        if item:
+            item.completed_at = None if item.completed_at else datetime.now(timezone.utc)
+            db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/lists/delete/{id}")
+def delete_list(id: int):
+    db = SessionLocal()
+    try:
+        db.query(CheckListItem).filter(CheckListItem.checklist_id == id).delete()
+        db.query(CheckList).filter(CheckList.id == id).delete()
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/lists/resurrect/{id}")
+def resurrect_list(id: int):
+    db = SessionLocal()
+    try:
+        lst = db.query(CheckList).filter(CheckList.id == id).first()
+        if lst:
+            lst.activated_at = datetime.now(timezone.utc)
+            db.commit()
     finally:
         db.close()
     return RedirectResponse("/", status_code=303)
