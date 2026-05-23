@@ -6,9 +6,7 @@ import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import text
-
-from app.database import engine, Base, SessionLocal
+from app.database import SessionLocal
 from app.models import Reminder, NagSchedule, SmsLog, AppState, ProcessedEmail
 from app.config import (
     USER_PHONE, USER_TIMEZONE, TICK_SECONDS, GMAIL_SYNC_INTERVAL,
@@ -70,14 +68,12 @@ def _is_event_time_reminder(db, reminder: "Reminder") -> bool:
     return later is None
 
 
-def _log_outbound(db, body: str, sid: str, related_type: str = None, related_id: int = None):
+def _log_outbound(db, body: str, sid: str):
     db.add(SmsLog(
         direction="outbound",
         phone=USER_PHONE,
         body=body,
         twilio_sid=sid,
-        related_type=related_type,
-        related_id=related_id,
     ))
 
 
@@ -93,7 +89,7 @@ def fire_due_reminders(db):
         try:
             result = send_sms(r.user_phone, r.message)
             r.sent_at = now
-            _log_outbound(db, r.message, result.get("sid", ""), "reminder", r.id)
+            _log_outbound(db, r.message, result.get("sid", ""))
 
             if r.cron_expression:
                 # Recurring reminder — reschedule for next fire
@@ -126,9 +122,9 @@ def _is_quiet_hours(tz_name):
 
 
 def _compute_deadline_interval(nag, now):
-    """Compute dynamic interval using Zeno's paradox: interval = 2/3 of remaining time.
+    """Compute dynamic interval using Zeno's paradox: interval = 1/3 of remaining time.
 
-    9 days out → wait 6 days → wait 4 days → wait 2.67 days → ... → clamp to min_interval.
+    9 days out → wait 3 days → wait 2 days → wait ~1.3 days → ... → clamp to min_interval.
     Past deadline: clamp to min_interval.
     """
     min_iv = nag.min_interval_minutes or DEFAULT_MIN_INTERVAL
@@ -137,7 +133,7 @@ def _compute_deadline_interval(nag, now):
         return min_iv
 
     remaining_minutes = (nag.deadline_at - now).total_seconds() / 60.0
-    interval = remaining_minutes * 2.0 / 3.0
+    interval = remaining_minutes / 3.0
     return max(min_iv, int(round(interval)))
 
 
@@ -151,30 +147,11 @@ def fire_due_nags(db):
 
     for nag in nags:
         try:
-            # Case 1: Cycle expired — end it
-            if nag.active_since and nag.nag_until and now >= nag.nag_until:
-                if nag.repeating:
-                    msg = f"Nag window for \"{nag.label}\" has ended. I'll pick this up next cycle."
-                    nag.active_since = None
-                    nag.nag_until = None
-                    nag.nag_count = 0
-                    nag.next_nag_at = _next_cron_fire(nag.cron_expression, nag.timezone)
-                else:
-                    msg = f"Nag window for \"{nag.label}\" has ended."
-                    nag.status = "deleted"
-                result = send_sms(nag.user_phone, msg)
-                _log_outbound(db, msg, result.get("sid", ""), "nag", nag.id)
-                db.commit()
-                log.info("Nag #%d cycle ended (deadline passed, repeating=%s): %s",
-                         nag.id, nag.repeating, nag.label)
-                continue
-
-            # Case 2: New cycle starting (dormant → active)
+            # Case 1: New cycle starting (dormant → active)
             if nag.active_since is None:
-                # Edge case: if max_duration is set and the entire window has already
-                # passed (e.g. scheduler was down), skip silently to next cycle
-                if nag.max_duration_minutes:
-                    window_end = nag.next_nag_at + timedelta(minutes=nag.max_duration_minutes)
+                # Recurring nag missed-cycle skip: if cycle_start + offset is already past, jump to next
+                if nag.repeating and nag.deadline_offset_minutes:
+                    window_end = nag.next_nag_at + timedelta(minutes=nag.deadline_offset_minutes)
                     if now >= window_end:
                         nag.next_nag_at = _next_cron_fire(nag.cron_expression, nag.timezone)
                         db.commit()
@@ -182,13 +159,13 @@ def fire_due_nags(db):
                         continue
 
                 nag.active_since = now
-                if nag.max_duration_minutes:
-                    nag.nag_until = now + timedelta(minutes=nag.max_duration_minutes)
-                else:
-                    nag.nag_until = None
                 nag.nag_count = 0
+                if nag.repeating and nag.deadline_offset_minutes is not None:
+                    # Recurring nag: deadline is computed fresh each cycle
+                    nag.deadline_at = now + timedelta(minutes=nag.deadline_offset_minutes)
+                # One-shot nag: deadline_at was set at creation — leave it alone
 
-            # Quiet hours gate — applies to all nag types
+            # Quiet hours gate — applies to all nags
             if _is_quiet_hours(nag.timezone):
                 from zoneinfo import ZoneInfo
                 tz = ZoneInfo(nag.timezone)
@@ -201,7 +178,7 @@ def fire_due_nags(db):
                 log.info("Nag #%d deferred to %s (quiet hours): %s", nag.id, resume_at, nag.label)
                 continue
 
-            # Case 3: Send nag (both new cycle first nag and ongoing)
+            # Case 2: Send nag (always uses Zeno curve off deadline_at; clamps to min past deadline)
             nag_num = nag.nag_count + 1
 
             if nag.deadline_at:
@@ -212,6 +189,7 @@ def fire_due_nags(db):
                     log.exception("GPT deadline message failed for nag #%d, using fallback", nag.id)
                     msg = f"(#{nag_num}) {nag.label} — deadline approaching!\nReply DONE when finished."
             else:
+                # Safety fallback: shouldn't happen post-refactor, but handle it anyway
                 msg = nag.message
                 if nag_num > 1:
                     msg = f"(#{nag_num}) {msg}"
@@ -221,14 +199,9 @@ def fire_due_nags(db):
 
             result = send_sms(nag.user_phone, msg)
             nag.nag_count = nag_num
-
-            if nag.deadline_at:
-                interval = _compute_deadline_interval(nag, now)
-            else:
-                interval = nag.interval_minutes
-
+            interval = _compute_deadline_interval(nag, now)
             nag.next_nag_at = now + timedelta(minutes=interval)
-            _log_outbound(db, msg, result.get("sid", ""), "nag", nag.id)
+            _log_outbound(db, msg, result.get("sid", ""))
             db.commit()
             log.info("Fired nag #%d (count=%d, interval=%dm): %s", nag.id, nag_num, interval, nag.label)
 
@@ -278,7 +251,7 @@ def fire_morning_briefing(db):
     try:
         msg = generate_morning_briefing()
         result = send_sms(USER_PHONE, msg)
-        _log_outbound(db, msg, result.get("sid", ""), "briefing")
+        _log_outbound(db, msg, result.get("sid", ""))
         _set_state(db, "briefing_last_sent_date", today_str)
         db.commit()
         log.info("Morning briefing sent")
@@ -312,7 +285,7 @@ def fire_exercise_morning(db):
     try:
         msg = generate_exercise_morning_message()
         result = send_sms(USER_PHONE, msg)
-        _log_outbound(db, msg, result.get("sid", ""), "exercise")
+        _log_outbound(db, msg, result.get("sid", ""))
         _set_state(db, "exercise_morning_last_sent_date", today_str)
         db.commit()
         log.info("Exercise morning motivation sent")
@@ -346,7 +319,7 @@ def fire_exercise_evening(db):
     try:
         msg = generate_exercise_evening_message()
         result = send_sms(USER_PHONE, msg)
-        _log_outbound(db, msg, result.get("sid", ""), "exercise")
+        _log_outbound(db, msg, result.get("sid", ""))
         _set_state(db, "exercise_evening_last_sent_date", today_str)
         db.commit()
         log.info("Exercise evening recommendation sent")
@@ -368,49 +341,8 @@ def main():
     """Main scheduler loop."""
     log.info("Starting scheduler (tick=%ds, gmail_sync=%ds)", TICK_SECONDS, GMAIL_SYNC_INTERVAL)
 
-    # Create tables on startup
-    Base.metadata.create_all(engine)
-
-    # Add new columns if missing (safe to re-run)
-    with engine.connect() as conn:
-        try:
-            conn.execute(text(
-                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS repeating BOOLEAN NOT NULL DEFAULT false"
-            ))
-            conn.execute(text(
-                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS recurrence_description VARCHAR(200)"
-            ))
-            conn.execute(text(
-                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS source VARCHAR(50)"
-            ))
-            conn.execute(text(
-                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS source_ref TEXT"
-            ))
-            conn.execute(text(
-                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ"
-            ))
-            conn.execute(text(
-                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ"
-            ))
-            conn.execute(text(
-                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS min_interval_minutes INTEGER"
-            ))
-            conn.execute(text(
-                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS max_interval_minutes INTEGER"
-            ))
-            conn.execute(text(
-                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS cron_expression VARCHAR(100)"
-            ))
-            conn.execute(text(
-                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS timezone VARCHAR(50) DEFAULT 'America/New_York'"
-            ))
-            # Data migration: update legacy 60-min nags to 120-min
-            conn.execute(text(
-                "UPDATE nag_schedules SET interval_minutes = 120 WHERE interval_minutes = 60 AND status = 'active' AND deadline_at IS NULL"
-            ))
-            conn.commit()
-        except Exception:
-            log.info("Column migration skipped (already exists)")
+    from app.migrations import run_migrations
+    run_migrations()
 
     # Send recovery notification
     try:
@@ -423,7 +355,7 @@ def main():
         result = send_sms(USER_PHONE, msg)
         db = SessionLocal()
         try:
-            _log_outbound(db, msg, result.get("sid", ""), "system")
+            _log_outbound(db, msg, result.get("sid", ""))
             db.commit()
         finally:
             db.close()

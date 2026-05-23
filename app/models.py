@@ -48,12 +48,9 @@ class NagSchedule(Base):
     user_phone = Column(String(20), nullable=False, index=True)
     label = Column(Text, nullable=False)
     message = Column(Text, nullable=False)
-    cron_expression = Column(String(100), nullable=False)
-    interval_minutes = Column(Integer, nullable=False)
-    max_duration_minutes = Column(Integer, nullable=True)
+    cron_expression = Column(String(100), nullable=True)
     timezone = Column(String(50), nullable=False, default="America/New_York")
     next_nag_at = Column(DateTime(timezone=True), nullable=False, index=True)
-    nag_until = Column(DateTime(timezone=True), nullable=True)
     active_since = Column(DateTime(timezone=True), nullable=True)
     nag_count = Column(Integer, nullable=False, default=0)
     repeating = Column(Boolean, nullable=False, default=False)
@@ -67,8 +64,8 @@ class NagSchedule(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     deadline_at = Column(DateTime(timezone=True), nullable=True)
+    deadline_offset_minutes = Column(Integer, nullable=True)
     min_interval_minutes = Column(Integer, nullable=True)
-    max_interval_minutes = Column(Integer, nullable=True)
 
 
 class ProcessedEmail(Base):
@@ -76,8 +73,6 @@ class ProcessedEmail(Base):
 
     id = Column(Integer, primary_key=True)
     message_id = Column(String(255), nullable=False, unique=True, index=True)
-    subject = Column(Text, nullable=True)
-    date = Column(String(100), nullable=True)
     processed_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
@@ -101,6 +96,23 @@ class ExerciseLog(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
+class BlockedPhoto(Base):
+    __tablename__ = "blocked_photos"
+
+    id = Column(Integer, primary_key=True)
+    filename = Column(String(255), nullable=False, unique=True, index=True)
+    blocked_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class DailyChecklistItem(Base):
+    __tablename__ = "daily_checklist_items"
+
+    id = Column(Integer, primary_key=True)
+    label = Column(Text, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
 class SmsLog(Base):
     __tablename__ = "sms_log"
 
@@ -109,6 +121,4 @@ class SmsLog(Base):
     phone = Column(String(20), nullable=False)
     body = Column(Text, nullable=False)
     twilio_sid = Column(String(64), nullable=True)
-    related_type = Column(String(30), nullable=True)
-    related_id = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)

@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.database import engine, Base, SessionLocal
-from app.models import Reminder, NagSchedule, ExerciseLog
+from app.models import Reminder, NagSchedule, DailyChecklistItem
 from app.config import USER_TIMEZONE
 
 app = FastAPI(title="ADHD Bot UI")
@@ -46,18 +46,97 @@ def _render_page(body: str) -> HTMLResponse:
   nav {{ margin-bottom: 16px; }}
   nav a {{ color: #7ec8e3; margin-right: 12px; }}
   .empty {{ color: #666; font-style: italic; }}
+  .checklist {{ list-style: none; padding: 0; }}
+  .checklist li {{ display: flex; align-items: center; padding: 8px 6px; border-bottom: 1px solid #2a2a2a; }}
+  .checklist li:hover {{ background: #2a2a2a; }}
+  .checklist input[type=checkbox] {{ width: 20px; height: 20px; margin-right: 12px; cursor: pointer; }}
+  .checklist .label {{ flex: 1; font-size: 15px; }}
+  .checklist .done .label {{ color: #777; text-decoration: line-through; }}
+  .checklist form {{ margin: 0; }}
+  .hint {{ color: #888; font-size: 12px; margin-bottom: 12px; }}
 </style>
 </head>
 <body>
 <h1>ADHD Bot</h1>
-<nav><a href="/">Reminders</a> <a href="/nags">Nags</a> <a href="/exercise">Exercise</a></nav>
+<nav><a href="/">Today</a> <a href="/reminders">Reminders</a> <a href="/nags">Nags</a></nav>
 {body}
 </body>
 </html>"""
     return HTMLResponse(html)
 
 
+def _local_today():
+    """Return the current date in the user's local timezone."""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo(USER_TIMEZONE)).date()
+
+
+def _is_done_today(item: DailyChecklistItem) -> bool:
+    """An item is checked iff its completed_at falls on today's local date."""
+    if item.completed_at is None:
+        return False
+    from zoneinfo import ZoneInfo
+    return item.completed_at.astimezone(ZoneInfo(USER_TIMEZONE)).date() == _local_today()
+
+
 @app.get("/", response_class=HTMLResponse)
+def checklist_page():
+    db = SessionLocal()
+    try:
+        rows = db.query(DailyChecklistItem).order_by(DailyChecklistItem.created_at.asc()).all()
+        hint = "<p class='hint'>Text \"##&lt;item&gt;\" to add. Resets at midnight.</p>"
+        if not rows:
+            return _render_page(f"<h2>Today</h2>{hint}<p class='empty'>No items yet.</p>")
+
+        lis = ""
+        for r in rows:
+            done = _is_done_today(r)
+            checked = "checked" if done else ""
+            done_class = "done" if done else ""
+            label = (r.label or "").replace("<", "&lt;").replace(">", "&gt;")
+            lis += f"""<li class="{done_class}">
+              <form method="post" action="/checklist/toggle/{r.id}">
+                <input type="checkbox" {checked} onchange="this.form.submit()">
+              </form>
+              <span class="label">{label}</span>
+              <form method="post" action="/checklist/delete/{r.id}">
+                <button class="btn" onclick="return confirm('Delete?')">del</button>
+              </form>
+            </li>"""
+
+        body = f"""<h2>Today ({len(rows)})</h2>
+        {hint}
+        <ul class="checklist">{lis}</ul>"""
+        return _render_page(body)
+    finally:
+        db.close()
+
+
+@app.post("/checklist/toggle/{id}")
+def toggle_checklist(id: int):
+    db = SessionLocal()
+    try:
+        item = db.query(DailyChecklistItem).filter(DailyChecklistItem.id == id).first()
+        if item:
+            item.completed_at = None if _is_done_today(item) else datetime.now(timezone.utc)
+            db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/checklist/delete/{id}")
+def delete_checklist_item(id: int):
+    db = SessionLocal()
+    try:
+        db.query(DailyChecklistItem).filter(DailyChecklistItem.id == id).delete()
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/reminders", response_class=HTMLResponse)
 def reminders_page():
     db = SessionLocal()
     try:
@@ -105,7 +184,7 @@ def delete_reminder(id: int):
         db.commit()
     finally:
         db.close()
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/reminders", status_code=303)
 
 
 @app.post("/delete/reminders/completed")
@@ -120,7 +199,7 @@ def delete_completed_reminders():
         db.commit()
     finally:
         db.close()
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/reminders", status_code=303)
 
 
 @app.get("/nags", response_class=HTMLResponse)
@@ -134,25 +213,25 @@ def nags_page():
         trs = ""
         for r in rows:
             active = "ACTIVE" if r.active_since else "-"
-            dur = f"{r.max_duration_minutes}m" if r.max_duration_minutes else "∞"
             anchor = ""
             if r.anchor_to_completion:
                 period = f"{r.cycle_months}mo" if r.cycle_months else f"{r.cycle_days}d"
                 anchor = f"&#x2693; {period}"
             repeating = r.recurrence_description if r.recurrence_description else ("Yes" if r.repeating else "No")
             source = r.source or "-"
-            deadline = _fmt(r.deadline_at) if r.deadline_at else "-"
             if r.deadline_at:
-                interval_display = "auto"
+                deadline = _fmt(r.deadline_at)
+            elif r.deadline_offset_minutes:
+                h, m = divmod(r.deadline_offset_minutes, 60)
+                deadline = f"T+{h}h{m:02d}m/cycle" if h else f"T+{m}m/cycle"
             else:
-                interval_display = f"{r.interval_minutes}m"
+                deadline = "-"
+            cron_display = r.cron_expression or "-"
             trs += f"""<tr>
               <td>{r.id}</td>
               <td>{r.label}</td>
               <td>{source}</td>
-              <td>{r.cron_expression}</td>
-              <td>{interval_display}</td>
-              <td>{dur}</td>
+              <td>{cron_display}</td>
               <td>{repeating}</td>
               <td>{deadline}</td>
               <td>{_fmt(r.next_nag_at)}</td>
@@ -173,7 +252,7 @@ def nags_page():
 
         table = f"""<h2>Nags ({len(rows)})</h2>
         {cleanup_btn}
-        <table><tr><th>ID</th><th>Label</th><th>Source</th><th>Cron</th><th>Interval</th><th>Duration</th><th>Repeating</th><th>Deadline</th><th>Next Nag</th><th>Status</th><th>Active</th><th>Anchor</th><th></th></tr>
+        <table><tr><th>ID</th><th>Label</th><th>Source</th><th>Cron</th><th>Repeating</th><th>Deadline</th><th>Next Nag</th><th>Status</th><th>Active</th><th>Anchor</th><th></th></tr>
         {trs}</table>"""
         return _render_page(table)
     finally:
@@ -189,68 +268,6 @@ def delete_nag(id: int):
     finally:
         db.close()
     return RedirectResponse("/nags", status_code=303)
-
-
-@app.get("/exercise", response_class=HTMLResponse)
-def exercise_page():
-    db = SessionLocal()
-    try:
-        rows = db.query(ExerciseLog).order_by(ExerciseLog.created_at.desc()).all()
-        if not rows:
-            return _render_page("<h2>Exercise Log</h2><p class='empty'>No activities logged.</p>")
-
-        trs = ""
-        for r in rows:
-            dist = f"{r.distance_miles} mi" if r.distance_miles else "-"
-            dur = f"{r.duration_minutes} min" if r.duration_minutes else "-"
-            notes = (r.notes[:60] + "...") if r.notes and len(r.notes) > 60 else (r.notes or "-")
-            trs += f"""<tr>
-              <td>{r.id}</td>
-              <td>{_fmt(r.created_at)}</td>
-              <td>{r.activity}</td>
-              <td>{dist}</td>
-              <td>{dur}</td>
-              <td>{notes}</td>
-              <td><form method="post" action="/delete/exercise/{r.id}" style="margin:0">
-                <button class="btn" onclick="return confirm('Delete?')">del</button>
-              </form></td>
-            </tr>"""
-
-        cleanup_btn = ""
-        if len(rows) > 1:
-            cleanup_btn = f"""<form method="post" action="/delete/exercise/all" style="margin:0;display:inline">
-              <button class="btn-cleanup" onclick="return confirm('Delete all {len(rows)} exercise log entries?')">Delete all ({len(rows)})</button>
-            </form>"""
-
-        table = f"""<h2>Exercise Log ({len(rows)})</h2>
-        {cleanup_btn}
-        <table><tr><th>ID</th><th>Date</th><th>Activity</th><th>Distance</th><th>Duration</th><th>Notes</th><th></th></tr>
-        {trs}</table>"""
-        return _render_page(table)
-    finally:
-        db.close()
-
-
-@app.post("/delete/exercise/{id}")
-def delete_exercise(id: int):
-    db = SessionLocal()
-    try:
-        db.query(ExerciseLog).filter(ExerciseLog.id == id).delete()
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/exercise", status_code=303)
-
-
-@app.post("/delete/exercise/all")
-def delete_all_exercise():
-    db = SessionLocal()
-    try:
-        db.query(ExerciseLog).delete(synchronize_session=False)
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/exercise", status_code=303)
 
 
 @app.post("/delete/nags/completed")

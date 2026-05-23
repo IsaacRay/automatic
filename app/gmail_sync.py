@@ -125,7 +125,9 @@ def sync_gmail_action_items():
 
     db = SessionLocal()
     try:
+        from app.intent_router import _end_of_day_local
         now = datetime.now(timezone.utc)
+        deadline = _end_of_day_local(now)
         created = 0
         for item in items:
             desc = item.get("description", "").strip()
@@ -146,11 +148,11 @@ def sync_gmail_action_items():
                 user_phone=USER_PHONE,
                 label=desc,
                 message=desc,
-                cron_expression="0 9 * * *",
-                interval_minutes=120,
-                max_duration_minutes=None,
+                cron_expression=None,
                 timezone=USER_TIMEZONE,
                 next_nag_at=now,
+                active_since=now,
+                deadline_at=deadline,
                 repeating=False,
                 source="gmail",
                 source_ref=source_ref,
@@ -182,11 +184,7 @@ def _mark_emails_processed(emails: list[dict]):
                 ProcessedEmail.message_id == msg_id
             ).first()
             if not exists:
-                db.add(ProcessedEmail(
-                    message_id=msg_id,
-                    subject=e.get("subject"),
-                    date=e.get("date"),
-                ))
+                db.add(ProcessedEmail(message_id=msg_id))
         db.commit()
     except Exception:
         log.exception("Error marking emails as processed")

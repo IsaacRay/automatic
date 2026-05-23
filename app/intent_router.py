@@ -46,6 +46,27 @@ def _random_nag_time() -> datetime:
     return candidate.astimezone(timezone.utc)
 
 
+def _validate_cron_expr(cron_expr: str) -> str | None:
+    """Return an error message if the cron expression is unusable, else None.
+
+    Catches the DOM+DOW both-restricted case, which croniter ORs — a trap
+    GPT falls into when approximating patterns cron can't natively express
+    (e.g. 'last weekday before the 15th' → '0 15 10-14 * 1-5' fires every
+    weekday because 10-14 OR Mon-Fri = Mon-Fri).
+    """
+    parts = cron_expr.split()
+    if len(parts) != 5:
+        return f"Cron expression has {len(parts)} fields, expected 5."
+    dom, dow = parts[2], parts[4]
+    if dom != "*" and dow != "*":
+        return (
+            "Cron can't restrict both day-of-month and day-of-week in the same "
+            "expression (they get OR'd, not AND'd). Please rephrase — e.g. "
+            "'last weekday of the month' uses 'LW' in the day-of-month slot."
+        )
+    return None
+
+
 def _next_cron_fire(cron_expr: str, tz_name: str) -> datetime:
     """Compute the next fire time for a cron expression, returned as UTC."""
     from zoneinfo import ZoneInfo
@@ -195,6 +216,9 @@ def _handle_create_reminder(db: Session, data: dict) -> str:
 
     # Recurring reminder (has cron_expression)
     if cron_expr:
+        cron_err = _validate_cron_expr(cron_expr)
+        if cron_err:
+            return f"Couldn't save that recurring reminder: {cron_err}"
         message = data.get("message") or f"Reminder: {label}"
         if reminders_data:
             fire_at = _parse_dt(reminders_data[0]["fire_at"])
@@ -537,7 +561,7 @@ def execute_acknowledge(db: Session, payload: dict) -> str:
             return "That nag no longer exists."
         if nag.repeating:
             nag.active_since = None
-            nag.nag_until = None
+            nag.deadline_at = None
             nag.nag_count = 0
             nag.next_nag_at = _next_nag_cycle(nag, now)
             db.commit()
@@ -587,7 +611,7 @@ def execute_acknowledge_all(db: Session, payload: dict) -> str:
     for nag in active_nags:
         if nag.repeating:
             nag.active_since = None
-            nag.nag_until = None
+            nag.deadline_at = None
             nag.nag_count = 0
             nag.next_nag_at = _next_nag_cycle(nag, now)
         else:
@@ -617,7 +641,7 @@ def _capture_acknowledge_undo(db: Session, matched_id: int, matched_type: str) -
             "nag_id": nag.id, "repeating": nag.repeating,
             "prev_status": nag.status,
             "prev_active_since": nag.active_since.isoformat() if nag.active_since else None,
-            "prev_nag_until": nag.nag_until.isoformat() if nag.nag_until else None,
+            "prev_deadline_at": nag.deadline_at.isoformat() if nag.deadline_at else None,
             "prev_nag_count": nag.nag_count,
             "prev_next_nag_at": nag.next_nag_at.isoformat() if nag.next_nag_at else None,
             "prev_completed_at": nag.completed_at.isoformat() if nag.completed_at else None,
@@ -648,7 +672,7 @@ def undo_acknowledge(db: Session, payload: dict) -> str:
         if nag:
             nag.status = undo["prev_status"]
             nag.active_since = _parse_dt(undo["prev_active_since"]) if undo.get("prev_active_since") else None
-            nag.nag_until = _parse_dt(undo["prev_nag_until"]) if undo.get("prev_nag_until") else None
+            nag.deadline_at = _parse_dt(undo["prev_deadline_at"]) if undo.get("prev_deadline_at") else None
             nag.nag_count = undo.get("prev_nag_count", 0)
             nag.next_nag_at = _parse_dt(undo["prev_next_nag_at"]) if undo.get("prev_next_nag_at") else None
             nag.completed_at = _parse_dt(undo["prev_completed_at"]) if undo.get("prev_completed_at") else None
@@ -675,7 +699,7 @@ def _capture_acknowledge_all_undo(db: Session) -> dict:
             "id": n.id, "repeating": n.repeating,
             "prev_status": n.status,
             "prev_active_since": n.active_since.isoformat() if n.active_since else None,
-            "prev_nag_until": n.nag_until.isoformat() if n.nag_until else None,
+            "prev_deadline_at": n.deadline_at.isoformat() if n.deadline_at else None,
             "prev_nag_count": n.nag_count,
             "prev_next_nag_at": n.next_nag_at.isoformat() if n.next_nag_at else None,
             "prev_completed_at": n.completed_at.isoformat() if n.completed_at else None,
@@ -702,7 +726,7 @@ def undo_acknowledge_all(db: Session, payload: dict) -> str:
         if nag:
             nag.status = snap["prev_status"]
             nag.active_since = _parse_dt(snap["prev_active_since"]) if snap.get("prev_active_since") else None
-            nag.nag_until = _parse_dt(snap["prev_nag_until"]) if snap.get("prev_nag_until") else None
+            nag.deadline_at = _parse_dt(snap["prev_deadline_at"]) if snap.get("prev_deadline_at") else None
             nag.nag_count = snap.get("prev_nag_count", 0)
             nag.next_nag_at = _parse_dt(snap["prev_next_nag_at"]) if snap.get("prev_next_nag_at") else None
             nag.completed_at = _parse_dt(snap["prev_completed_at"]) if snap.get("prev_completed_at") else None
@@ -718,50 +742,66 @@ def undo_acknowledge_all(db: Session, payload: dict) -> str:
     return f"Undone! Restored {total} items."
 
 
+def _end_of_day_local(dt_utc: datetime) -> datetime:
+    """Return 11pm local on the calendar day of dt_utc (next day if already past 11pm)."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(USER_TIMEZONE)
+    local = dt_utc.astimezone(tz)
+    eleven_pm = local.replace(hour=23, minute=0, second=0, microsecond=0)
+    if eleven_pm <= local:
+        eleven_pm += timedelta(days=1)
+    return eleven_pm.astimezone(timezone.utc)
+
+
+def _default_offset_to_eleven_pm(cron_expr: str) -> int:
+    """For recurring nags: minutes from the cron's hour/minute to 23:00 (same day).
+    Falls back to 720 (12h) when cron hour/minute are not simple integers."""
+    parts = cron_expr.split()
+    try:
+        minute = int(parts[0])
+        hour = int(parts[1])
+    except (ValueError, IndexError):
+        return 720
+    cron_minutes = hour * 60 + minute
+    eleven_pm = 23 * 60
+    if cron_minutes < eleven_pm:
+        return eleven_pm - cron_minutes
+    return (24 * 60) - cron_minutes + eleven_pm
+
+
 def _handle_create_nag(db: Session, data: dict) -> str:
     label = data.get("label", "Nag")
     message = data.get("message", f"Reminder: {label}")
-    cron_expr = data.get("cron_expression", "")
-    interval = data.get("interval_minutes", 15)
-    max_dur = data.get("max_duration_minutes")
-    repeating = data.get("repeating", False)
-    anchor = data.get("anchor_to_completion", False)
-    if anchor:
-        repeating = True
+    cron_expr = data.get("cron_expression") or None
+    anchor = bool(data.get("anchor_to_completion", False))
     cycle_months = data.get("cycle_months")
     cycle_days = data.get("cycle_days")
     first_nag_at = data.get("first_nag_at")
     user_specified_time = data.get("user_specified_time", True)
     recurrence_desc = data.get("recurrence_description")
     deadline_at_str = data.get("deadline_at")
+    deadline_offset_minutes = data.get("deadline_offset_minutes")
     min_interval = data.get("min_interval_minutes")
 
-    # Default cron if none provided
-    if not cron_expr:
-        cron_expr = "0 12 * * *"
+    cron_unsupported = data.get("cron_unsupported_reason")
+    if cron_unsupported and not cron_expr:
+        return (
+            f"I couldn't turn that into a valid schedule — {cron_unsupported} "
+            "isn't expressible in cron. Try rephrasing (e.g. 'last weekday of the month')."
+        )
 
-    # Parse deadline
-    deadline_at = _parse_dt(deadline_at_str) if deadline_at_str else None
+    repeating = anchor or bool(cron_expr)
     now = datetime.now(timezone.utc)
 
-    if deadline_at:
-        # Deadline nags start active immediately, no cron cycling
-        next_fire = now
-        # No max_duration — the nag runs until done or cancelled
-        max_dur = None
-    else:
-        # Auto-default max_duration_minutes for repeating nags to prevent infinite nagging.
-        # Exception: completion-anchored nags should nag indefinitely until acknowledged.
-        if repeating and max_dur is None and not anchor:
-            cron_dow = cron_expr.split()[4] if len(cron_expr.split()) >= 5 else "*"
-            if cycle_months or "monthly" in (recurrence_desc or "").lower():
-                max_dur = 2880   # 48 hours for monthly
-            elif cycle_days and cycle_days >= 7:
-                max_dur = 1440   # 24 hours for weekly
-            elif cron_dow not in ("*", "0-6", "0,1,2,3,4,5,6"):
-                max_dur = 720    # 12 hours for weekday/partial-week
-            else:
-                max_dur = 720    # 12 hours default for daily
+    if repeating:
+        if not cron_expr:
+            cron_expr = "0 12 * * *"
+        cron_err = _validate_cron_expr(cron_expr)
+        if cron_err:
+            return f"Couldn't save that nag: {cron_err}"
+
+        if not deadline_offset_minutes:
+            deadline_offset_minutes = _default_offset_to_eleven_pm(cron_expr)
 
         if first_nag_at:
             next_fire = _parse_dt(first_nag_at)
@@ -770,13 +810,28 @@ def _handle_create_nag(db: Session, data: dict) -> str:
         else:
             next_fire = _next_cron_fire(cron_expr, USER_TIMEZONE)
 
+        active_since = None
+        deadline_at = None  # recomputed each cycle by the scheduler
+    else:
+        # One-shot deadline nag
+        deadline_at = _parse_dt(deadline_at_str) if deadline_at_str else None
+        if first_nag_at:
+            # Explicit "start nagging at Z" — stay dormant until then
+            next_fire = _parse_dt(first_nag_at)
+            active_since = None
+            anchor_time = next_fire
+        else:
+            next_fire = now
+            active_since = now
+            anchor_time = now
+        if not deadline_at:
+            deadline_at = _end_of_day_local(anchor_time)
+
     nag = NagSchedule(
         user_phone=USER_PHONE,
         label=label,
         message=message,
         cron_expression=cron_expr,
-        interval_minutes=interval,
-        max_duration_minutes=max_dur,
         repeating=repeating,
         recurrence_description=recurrence_desc,
         timezone=USER_TIMEZONE,
@@ -785,28 +840,30 @@ def _handle_create_nag(db: Session, data: dict) -> str:
         cycle_months=cycle_months,
         cycle_days=cycle_days,
         deadline_at=deadline_at,
+        deadline_offset_minutes=deadline_offset_minutes,
         min_interval_minutes=min_interval,
+        active_since=active_since,
+        nag_count=0,
         status="active",
     )
-    if deadline_at:
-        nag.active_since = now
-        nag.nag_count = 0
     db.add(nag)
     db.commit()
 
     # Build confirmation message
-    if deadline_at:
-        past_warning = " (deadline already passed — nagging at max frequency!)" if deadline_at <= now else ""
-        parts = [f"Deadline nag set: \"{label}\" due {_format_time(deadline_at)}{past_warning}"]
-        if min_interval:
-            parts.append(f" (min interval: {min_interval}min)")
-    else:
-        parts = [f"Nag set: \"{label}\" every {interval} min"]
+    if repeating:
+        hours, mins = divmod(deadline_offset_minutes, 60)
+        offset_desc = f"{hours}h{mins:02d}m" if hours else f"{mins}m"
+        parts = [f"Recurring nag set: \"{label}\" — deadline {offset_desc} after each cycle start"]
         if recurrence_desc:
             parts.append(f", {recurrence_desc}")
         if anchor:
             period = f"{cycle_months} month(s)" if cycle_months else f"{cycle_days} day(s)"
             parts.append(f", next cycle {period} after completion")
+    else:
+        past_warning = " (deadline already passed — nagging at max frequency!)" if deadline_at <= now else ""
+        parts = [f"Nag set: \"{label}\" — deadline {_format_time(deadline_at)}{past_warning}"]
+    if min_interval:
+        parts.append(f" (min interval: {min_interval}min)")
     parts.append(f". First: {_format_time(next_fire)}")
     return "".join(parts)
 
@@ -875,7 +932,7 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
         ).all():
             state = "ACTIVE" if n.active_since else "waiting"
             ack_items.append({"id": n.id, "type": "nag", "label": n.label,
-                              "detail": f"every {n.interval_minutes}min [{state}]",
+                              "detail": f"deadline {_format_time(n.deadline_at)} [{state}]" if n.deadline_at else f"[{state}]",
                               "message": n.message})
 
         for r in db.query(Reminder).filter(
@@ -955,8 +1012,9 @@ def _handle_cancel(db: Session, data: dict) -> str:
             NagSchedule.status == "active",
         ).order_by(NagSchedule.created_at.desc()).all():
             state = "ACTIVE" if n.active_since else "waiting"
+            deadline_str = f", deadline {_format_time(n.deadline_at)}" if n.deadline_at else ""
             items.append({"id": n.id, "type": "nag", "label": n.label,
-                          "detail": f"every {n.interval_minutes}min [{state}], next: {_format_time(n.next_nag_at)}",
+                          "detail": f"[{state}]{deadline_str}, next: {_format_time(n.next_nag_at)}",
                           "message": n.message})
 
     if not items:
@@ -1061,7 +1119,7 @@ def _handle_snooze(db: Session, data: dict) -> str:
         ).all():
             state = "ACTIVE" if n.active_since else "waiting"
             items.append({"id": n.id, "type": "nag", "label": n.label,
-                           "detail": f"every {n.interval_minutes}min [{state}]",
+                           "detail": f"deadline {_format_time(n.deadline_at)} [{state}]" if n.deadline_at else f"[{state}]",
                            "message": n.message})
 
         for r in db.query(Reminder).filter(
@@ -1130,6 +1188,8 @@ def execute_snooze(db: Session, payload: dict) -> str:
         if not nag:
             return "That nag no longer exists."
         nag.next_nag_at = snooze_until
+        if nag.deadline_at:
+            nag.deadline_at = nag.deadline_at + timedelta(minutes=duration)
         db.commit()
         log.info("Snoozed nag #%d for %d min: %s", nag.id, duration, nag.label)
         return f"Snoozed \"{nag.label}\" for {duration} min."
@@ -1155,7 +1215,11 @@ def _capture_snooze_undo(db: Session, matched_id: int, matched_type: str) -> dic
     if matched_type == "nag":
         nag = db.query(NagSchedule).filter(NagSchedule.id == matched_id).first()
         if nag:
-            return {"nag_id": nag.id, "prev_next_nag_at": nag.next_nag_at.isoformat() if nag.next_nag_at else None}
+            return {
+                "nag_id": nag.id,
+                "prev_next_nag_at": nag.next_nag_at.isoformat() if nag.next_nag_at else None,
+                "prev_deadline_at": nag.deadline_at.isoformat() if nag.deadline_at else None,
+            }
     elif matched_type == "reminder":
         r = db.query(Reminder).filter(Reminder.id == matched_id).first()
         if r:
@@ -1172,8 +1236,11 @@ def undo_snooze(db: Session, payload: dict) -> str:
 
     if "nag_id" in undo:
         nag = db.query(NagSchedule).filter(NagSchedule.id == undo["nag_id"]).first()
-        if nag and undo.get("prev_next_nag_at"):
-            nag.next_nag_at = _parse_dt(undo["prev_next_nag_at"])
+        if nag:
+            if undo.get("prev_next_nag_at"):
+                nag.next_nag_at = _parse_dt(undo["prev_next_nag_at"])
+            if undo.get("prev_deadline_at"):
+                nag.deadline_at = _parse_dt(undo["prev_deadline_at"])
 
     if "reminder_id" in undo:
         r = db.query(Reminder).filter(Reminder.id == undo["reminder_id"]).first()
@@ -1216,8 +1283,12 @@ def _handle_list(db: Session, data: dict) -> str:
             src = f" [from: {n.source}]" if n.source else ""
             if n.deadline_at:
                 interval_desc = f" deadline: {_format_time(n.deadline_at)}"
+            elif n.deadline_offset_minutes:
+                h, m = divmod(n.deadline_offset_minutes, 60)
+                off = f"{h}h{m:02d}m" if h else f"{m}m"
+                interval_desc = f" deadline +{off}/cycle"
             else:
-                interval_desc = f" every {n.interval_minutes}min"
+                interval_desc = ""
             lines.append(f"  - {n.label}{interval_desc}{recurrence} [{state}]{src} (next: {_format_time(n.next_nag_at)})")
 
     if not lines:

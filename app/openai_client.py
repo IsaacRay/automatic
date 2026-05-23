@@ -65,34 +65,51 @@ For meetings/events: create TWO reminders — a prep reminder 30 minutes before 
 - "parent_event_id": a unique string to group related reminders (use format "evt_<timestamp>")
 - "cron_expression": optional, 5-field cron expression for recurring reminders (minute hour day month weekday). Set this when the user wants to be reminded on a recurring schedule (e.g., "every Tuesday at 3pm" → "0 15 * * 2", "every day at 5pm" → "0 17 * * *", "every weekday at 9am" → "0 9 * * 1-5"). Do NOT set this for one-time reminders. When cron_expression is set, do NOT use parent_event_id or create prep/event pairs — just provide a single "message" field with the reminder text.
 
-**create_nag**: The user wants to be nagged repeatedly at a fixed interval until they reply "done". Trigger words: "nag", "keep reminding", "bug me", "pester", "every X minutes until", "nag me".
-This is different from a recurring reminder (which fires once per schedule) — nags repeat rapidly within a window until acknowledged.
+**create_nag**: The user wants to be nagged repeatedly until they reply "done". Trigger words: "nag", "keep reminding", "bug me", "pester", "nag me".
 
-IMPORTANT — distinguish TWO separate concepts:
-  (a) INTERVAL: how often to nag within a single cycle (e.g. "every 15 min" → interval_minutes=15). This is the rapid nagging frequency.
-  (b) RECURRENCE: how often the nag cycle repeats (e.g. "weekdays", "daily", "weekly"). This sets repeating=true and controls the cron_expression.
-A message like "nag me every 15 min weekdays at 9am" has BOTH: interval=15, recurrence=weekdays at 9am.
-A message like "nag me every 30 min to call the dentist" has ONLY interval=30, no recurrence (one-time nag).
+EVERY nag is a deadline nag. The system ramps up nag frequency automatically (Zeno curve: interval = 1/3 of remaining time, clamped to a floor) as the deadline approaches. You do NOT emit a nag interval — just the deadline timing.
 
-- "label": short description (e.g. "enter timesheet")
-- "message": the nag SMS text to send each time (e.g. "Hey! Enter your timesheet!")
-- "cron_expression": 5-field cron for when each nag CYCLE starts (e.g. "0 9 * * 1-5" for 9am weekdays). For completion-anchored nags, this controls the nag time-of-day only (e.g. "0 9 * * *" for 9am daily nags). If the user doesn't specify a time, use "0 12 * * *" as a placeholder — the system will pick a random time between 9am-5pm automatically.
-  Common recurrence-to-cron mappings:
+There are two shapes:
+
+**A. One-shot nag** (no recurrence language): the user wants to be bugged about one task, once.
+  - The deadline defaults to 11pm local today if not stated. You can leave `deadline_at` null and the system will fill it.
+  - If the user says "by X time" / "before Y" / "deadline is Z", put that in `deadline_at`.
+  - If the user says "start nagging at Z" / "begin at Z", put that in `first_nag_at` (the nag stays dormant until then).
+  - Default: if neither is given, the nag starts now and the deadline is 11pm today.
+
+**B. Recurring nag** (language like "every Monday", "weekly", "monthly"): the user wants a schedule.
+  - Set `cron_expression` to the cycle-start schedule (e.g. "0 9 * * 1-5" for 9am weekdays).
+  - The deadline defaults to 11pm local on the cycle's start day. Override with `deadline_offset_minutes` (minutes from cycle start to deadline) only if the user specifies something other than end-of-day.
+  - Set `anchor_to_completion=true` if the user wants the NEXT cycle to start relative to when they finished (not when the cron says). Implies a `cycle_months` or `cycle_days` value for the gap.
+
+Cron rules (apply to B):
+  - Fields are (minute hour day-of-month month day-of-week).
+  - HARD RULE: NEVER restrict both day-of-month AND day-of-week at the same time — this system ORs them (so "10-14 * 1-5" fires on every weekday, not weekday-in-10-14). Pick ONE or leave it `*`.
+  - Extensions (croniter): `L` = last day of month, `LW` = last WEEKDAY of month (Mon-Fri), `5L` = last Friday (0=Sun..6=Sat), `W` = nearest weekday to a date. Use these when they match intent — don't approximate with day ranges.
+  - Mappings:
     - "daily at 9am" → "0 9 * * *"
     - "weekdays at 9am" → "0 9 * * 1-5"
     - "weekly on Monday at 9am" → "0 9 * * 1"
     - "monthly on the 1st at 9am" → "0 9 1 * *"
-- "interval_minutes": how often to nag within the cycle (e.g. 15). This is the rapid nagging frequency within a window, NOT the recurrence.
-- "max_duration_minutes": how long the nag window lasts from cycle start (e.g. 120 for 2 hours). null if no limit specified by the user.
-- "user_specified_time": boolean. true if the user explicitly mentioned a time (e.g. "at 9am", "at noon", "in 2 hours"). false if no time was given (e.g. "nag me to call the dentist"). When false, the system picks a random time between 9am-5pm.
-- "repeating": boolean (default false). If false, the nag fires for ONE cycle only and is deleted once the user replies DONE or the window expires. If true, it repeats on the cron schedule. Set to true when recurrence language is present (e.g. "daily", "weekdays", "every Monday", "every month"). Keep false for one-shot nags with no recurrence (e.g. "nag me to call the dentist every 30 min").
-- "recurrence_description": string or null. Human-readable description of the recurrence pattern. Examples: "daily at 9:00 AM", "weekdays at 9:00 AM", "weekly on Monday at 9:00 AM", "monthly on the 1st at 9:00 AM". Set to null when repeating=false.
-- "anchor_to_completion": boolean (default false). If true, the NEXT cycle starts relative to when the user completes the task, not the cron schedule. Implies repeating=true. Example: "give dog meds every month, nag daily until done" — if due March 22 but completed March 24, next cycle starts April 24. Use this when the user says things like "adjust the next date based on when I finish" or implies a monthly/weekly task where timing shifts based on completion.
-- "cycle_months": integer or null. Number of months between cycles when anchor_to_completion is true (e.g. 1 for monthly).
-- "cycle_days": integer or null. Number of days between cycles when anchor_to_completion is true. Use this OR cycle_months, not both. For "every 2 weeks" use 14.
-- "first_nag_at": ISO 8601 datetime in {USER_TIMEZONE} local time (do NOT convert to UTC) for when the FIRST cycle should start, if the user specifies a specific date (e.g. "starting March 22nd"). null if not specified (will use cron_expression to compute).
-- "deadline_at": ISO 8601 datetime in {USER_TIMEZONE} local time (do NOT convert to UTC). Set when the user specifies a hard deadline (e.g. "by 5pm", "before Friday", "deadline is March 30", "due by end of day"). When a deadline is present, the system will automatically ramp up nag frequency as the deadline approaches using an exponential curve — no need to set interval_minutes. null if no deadline specified.
-- "min_interval_minutes": integer or null. Minimum nag interval in minutes (floor for the deadline curve). Set when the user says things like "but no more than every 10 min" or "minimum 15 min apart". Default is 5 if not specified.
+    - "last day of every month at 3pm" → "0 15 L * *"
+    - "last weekday of every month at 3pm" → "0 15 LW * *"
+    - "last Friday of every month at 3pm" → "0 15 * * 5L"
+  - If the schedule CANNOT be expressed in cron (e.g. "last weekday before the 15th"), leave `cron_expression` null and set `cron_unsupported_reason` — the system will ask the user to rephrase.
+
+Fields:
+- "label": short description (e.g. "sign timesheet").
+- "message": the nag SMS text (e.g. "Sign your timesheet!").
+- "cron_expression": null for one-shot nags, a 5-field cron for recurring nags.
+- "cron_unsupported_reason": string or null. Only set when you cannot express the user's schedule in standard cron.
+- "user_specified_time": boolean. true if the user named a time; false if they didn't (the system may pick a random 9am–5pm slot). Only relevant for recurring with no `first_nag_at`.
+- "recurrence_description": string or null. Human-readable for recurring nags (e.g. "weekdays at 9:00 AM"). null for one-shot.
+- "anchor_to_completion": boolean (default false). Recurring only — next cycle starts relative to when the user marks DONE.
+- "cycle_months": integer or null. Months between cycles for anchor_to_completion (e.g. 1 for monthly).
+- "cycle_days": integer or null. Days between cycles for anchor_to_completion (e.g. 14 for every 2 weeks). Use this OR cycle_months, not both.
+- "first_nag_at": ISO 8601 local-time string (do NOT convert to UTC). For one-shot: when nagging should START (user said "start at Z"). For recurring: when the FIRST cycle should start (user said "starting March 22nd"). null otherwise.
+- "deadline_at": ISO 8601 local-time string (do NOT convert to UTC). One-shot only — the hard deadline. null means "default to 11pm today".
+- "deadline_offset_minutes": integer or null. Recurring only — minutes from each cycle's start to that cycle's deadline. null means "default to 11pm same day".
+- "min_interval_minutes": integer or null. Floor for the Zeno curve. Set when user says "no more than every 10 min" or similar.
 
 **acknowledge**: The user is marking something as done. Trigger words: "done", "finished", "completed", "got it", "handled".
 - "keyword": optional keyword to match a specific item (null to mark most recent)

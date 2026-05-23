@@ -68,10 +68,13 @@ services:
     build: .
     environment:
       APP_MODE: slideshow
+      DATABASE_URL: postgresql+psycopg2://adhdbot:${POSTGRES_PASSWORD:-change-me}@db:5432/adhdbot
     ports:
       - "8082:8082"
     volumes:
       - ./photos:/app/photos:ro
+    depends_on:
+      - db
     restart: unless-stopped
 
 volumes:

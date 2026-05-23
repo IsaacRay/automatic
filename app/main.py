@@ -9,8 +9,8 @@ from datetime import datetime, timezone
 import requests as http_requests
 from fastapi import FastAPI, Form, Request, Response
 
-from app.database import engine, Base, SessionLocal
-from app.models import SmsLog, PendingConfirmation
+from app.database import SessionLocal
+from app.models import SmsLog, PendingConfirmation, DailyChecklistItem
 from app.config import USER_PHONE, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 from app.openai_client import parse_user_sms
 from app.intent_router import handle_intent, undo_reschedule, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag
@@ -30,8 +30,8 @@ EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
 
 @app.on_event("startup")
 def on_startup():
-    Base.metadata.create_all(engine)
-    log.info("Database tables created/verified.")
+    from app.migrations import run_migrations
+    run_migrations()
 
 
 @app.get("/health")
@@ -102,13 +102,12 @@ async def incoming_sms(request: Request):
             reply = _handle_create_nag(db, {
                 "label": label,
                 "message": f"Reminder: {label}",
-                "interval_minutes": 120,
                 "first_nag_at": now_iso,
             })
             # Send the first nag immediately to the user
             send_sms(USER_PHONE, f"Reminder: {label}")
             # Send confirmation to the 973 number
-            send_sms(KATHRYN_PHONE, f"Reminder created: \"{label}\" (every 2 hrs)")
+            send_sms(KATHRYN_PHONE, f"Reminder created: \"{label}\" (deadline 11pm)")
             db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=""))
             db.commit()
         except Exception:
@@ -143,8 +142,29 @@ async def incoming_sms(request: Request):
 
     log.info("Inbound SMS from %s: %s", From, Body[:100])
 
-    # Relay message to Kathryn if prefixed with "kk"
     stripped = Body.strip()
+
+    # Add to daily checklist if prefixed with "##"
+    if stripped.startswith("##"):
+        item_label = stripped[2:].strip()
+        if item_label:
+            db = SessionLocal()
+            try:
+                db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+                db.add(DailyChecklistItem(label=item_label))
+                db.commit()
+                reply = f'Added to checklist: "{item_label}"'
+                result = send_sms(USER_PHONE, reply)
+                db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=result.get("sid", "")))
+                db.commit()
+            except Exception:
+                log.exception("Error adding checklist item")
+                db.rollback()
+            finally:
+                db.close()
+            return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+    # Relay message to Kathryn if prefixed with "kk"
     if stripped[:2].lower() == "kk":
         relay_body = stripped[2:].strip()
         if relay_body:
