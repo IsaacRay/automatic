@@ -67,22 +67,35 @@ def _validate_cron_expr(cron_expr: str) -> str | None:
     return None
 
 
-def _next_cron_fire(cron_expr: str, tz_name: str) -> datetime:
-    """Compute the next fire time for a cron expression, returned as UTC."""
+def _next_cron_fire(cron_expr: str, tz_name: str, after: datetime = None) -> datetime:
+    """Compute the next fire time for a cron expression, returned as UTC.
+
+    The next fire strictly after `after` (default: now) is returned.
+    """
     from zoneinfo import ZoneInfo
     from croniter import croniter
-    local_now = datetime.now(ZoneInfo(tz_name))
-    cron = croniter(cron_expr, local_now)
+    tz = ZoneInfo(tz_name)
+    base = after.astimezone(tz) if after else datetime.now(tz)
+    cron = croniter(cron_expr, base)
     next_local = cron.get_next(datetime)
     return next_local.astimezone(timezone.utc)
+
+
+def _end_of_today_local(now: datetime, tz_name: str) -> datetime:
+    """The last moment of `now`'s local day, used to skip same-day cron fires."""
+    from zoneinfo import ZoneInfo
+    return now.astimezone(ZoneInfo(tz_name)).replace(hour=23, minute=59, second=59, microsecond=0)
 
 
 def _next_nag_cycle(nag, completion_time: datetime = None) -> datetime:
     """Compute the next cycle start for a nag schedule.
 
     If anchor_to_completion is True, the next cycle is relative to completion_time.
-    Otherwise, falls back to the cron expression.
+    Otherwise, falls back to the cron expression. Cron-based next cycles skip any
+    remaining fire on the completion day, so checking a daily item off clears it
+    from today's list until tomorrow.
     """
+    after_today = _end_of_today_local(completion_time or datetime.now(timezone.utc), nag.timezone)
     if nag.anchor_to_completion and completion_time:
         from zoneinfo import ZoneInfo
         from dateutil.relativedelta import relativedelta
@@ -92,7 +105,7 @@ def _next_nag_cycle(nag, completion_time: datetime = None) -> datetime:
         elif nag.cycle_days:
             next_local = local_completion + timedelta(days=nag.cycle_days)
         else:
-            return _next_cron_fire(nag.cron_expression, nag.timezone)
+            return _next_cron_fire(nag.cron_expression, nag.timezone, after=after_today)
         # Preserve the nag start hour/minute from the cron expression
         from croniter import croniter
         # Parse hour/minute from cron (fields: min hour dom month dow)
@@ -105,7 +118,7 @@ def _next_nag_cycle(nag, completion_time: datetime = None) -> datetime:
             except ValueError:
                 pass  # wildcard or complex cron — just keep the completion time-of-day
         return next_local.astimezone(timezone.utc)
-    return _next_cron_fire(nag.cron_expression, nag.timezone)
+    return _next_cron_fire(nag.cron_expression, nag.timezone, after=after_today)
 
 
 
