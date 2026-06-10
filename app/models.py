@@ -91,15 +91,6 @@ class BlockedPhoto(Base):
     blocked_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
-class DailyChecklistItem(Base):
-    __tablename__ = "daily_checklist_items"
-
-    id = Column(Integer, primary_key=True)
-    label = Column(Text, nullable=False)
-    completed_at = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-
-
 class CheckList(Base):
     __tablename__ = "checklists"
 

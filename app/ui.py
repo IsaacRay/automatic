@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.database import engine, Base, SessionLocal
-from app.models import NagSchedule, DailyChecklistItem, CheckList, CheckListItem
+from app.models import NagSchedule, CheckList, CheckListItem
 from app.config import USER_TIMEZONE
 
 app = FastAPI(title="ADHD Bot UI")
@@ -65,20 +65,6 @@ def _render_page(body: str) -> HTMLResponse:
     return HTMLResponse(html)
 
 
-def _local_today():
-    """Return the current date in the user's local timezone."""
-    from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo(USER_TIMEZONE)).date()
-
-
-def _is_done_today(item: DailyChecklistItem) -> bool:
-    """An item is checked iff its completed_at falls on today's local date."""
-    if item.completed_at is None:
-        return False
-    from zoneinfo import ZoneInfo
-    return item.completed_at.astimezone(ZoneInfo(USER_TIMEZONE)).date() == _local_today()
-
-
 def _render_today_nags(db) -> str:
     """Render the today list: active nags due/scheduled for today, with check-off."""
     from app.context_engine import today_items
@@ -104,7 +90,7 @@ def _render_today_nags(db) -> str:
         )
         lis += f"""<li>
           <form method="post" action="/nag/done/{n.id}">
-            <button class="btn" style="background:#5cb85c" onclick="return confirm('Mark done?')">done</button>
+            <input type="checkbox" onchange="this.form.submit()">
           </form>
           <span class="label">{label}</span>{snooze_badge}
           <span style="color:#888;font-size:12px">due {deadline} · next {nextnag}</span>
@@ -127,59 +113,9 @@ def nag_done(id: int):
 def checklist_page():
     db = SessionLocal()
     try:
-        nags_block = _render_today_nags(db)
-        rows = db.query(DailyChecklistItem).order_by(DailyChecklistItem.created_at.asc()).all()
-        hint = "<p class='hint'>Text \"##&lt;item&gt;\" to add. Resets at midnight.</p>"
-        if not rows:
-            return _render_page(f"{nags_block}<h2>Daily Checklist</h2>{hint}<p class='empty'>No items yet.</p>")
-
-        lis = ""
-        for r in rows:
-            done = _is_done_today(r)
-            checked = "checked" if done else ""
-            done_class = "done" if done else ""
-            label = (r.label or "").replace("<", "&lt;").replace(">", "&gt;")
-            lis += f"""<li class="{done_class}">
-              <form method="post" action="/checklist/toggle/{r.id}">
-                <input type="checkbox" {checked} onchange="this.form.submit()">
-              </form>
-              <span class="label">{label}</span>
-              <form method="post" action="/checklist/delete/{r.id}">
-                <button class="btn" onclick="return confirm('Delete?')">del</button>
-              </form>
-            </li>"""
-
-        body = f"""{nags_block}
-        <h2>Daily Checklist ({len(rows)})</h2>
-        {hint}
-        <ul class="checklist">{lis}</ul>"""
-        return _render_page(body)
+        return _render_page(_render_today_nags(db))
     finally:
         db.close()
-
-
-@app.post("/checklist/toggle/{id}")
-def toggle_checklist(id: int):
-    db = SessionLocal()
-    try:
-        item = db.query(DailyChecklistItem).filter(DailyChecklistItem.id == id).first()
-        if item:
-            item.completed_at = None if _is_done_today(item) else datetime.now(timezone.utc)
-            db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/", status_code=303)
-
-
-@app.post("/checklist/delete/{id}")
-def delete_checklist_item(id: int):
-    db = SessionLocal()
-    try:
-        db.query(DailyChecklistItem).filter(DailyChecklistItem.id == id).delete()
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/", status_code=303)
 
 
 def _escape(s: str) -> str:

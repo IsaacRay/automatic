@@ -10,7 +10,7 @@ import requests as http_requests
 from fastapi import FastAPI, Form, Request, Response
 
 from app.database import SessionLocal
-from app.models import SmsLog, PendingConfirmation, DailyChecklistItem, CheckList, CheckListItem, NagSchedule
+from app.models import SmsLog, PendingConfirmation, CheckList, CheckListItem, NagSchedule
 from app.config import USER_PHONE, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 from app.openai_client import parse_user_sms
 from app.intent_router import handle_intent, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag, _handle_help, _apply_deadline_reply
@@ -276,26 +276,6 @@ async def incoming_sms(request: Request):
         finally:
             db.close()
         return Response(content=EMPTY_TWIML, media_type="application/xml")
-
-    # Add to daily checklist if prefixed with "##"
-    if stripped.startswith("##"):
-        item_label = stripped[2:].strip()
-        if item_label:
-            db = SessionLocal()
-            try:
-                db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
-                db.add(DailyChecklistItem(label=item_label))
-                db.commit()
-                reply = f'Added to checklist: "{item_label}"'
-                result = send_sms(USER_PHONE, reply)
-                db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=result.get("sid", "")))
-                db.commit()
-            except Exception:
-                log.exception("Error adding checklist item")
-                db.rollback()
-            finally:
-                db.close()
-            return Response(content=EMPTY_TWIML, media_type="application/xml")
 
     # Relay message to Kathryn if prefixed with "kk"
     if stripped[:2].lower() == "kk":

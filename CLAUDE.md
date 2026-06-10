@@ -22,11 +22,10 @@ Four Docker services (`docker-compose.yaml`):
 | `processed_emails` | Tracks Gmail Message-IDs to prevent re-processing |
 | `app_state` | Key-value scheduler state (e.g., "briefing_last_sent_date", "last_nag_sent_at" for the global nag gate, "user_context" for the latest location/intent) |
 | `sms_log` | Full audit log of all inbound/outbound SMS |
-| `daily_checklist_items` | Recurring daily checklist items (added via `##`, auto-reset each local day) |
 | `checklists` | Named, one-off checklists (created via `#newlist`) |
 | `checklist_items` | Items belonging to a `checklists` row (ordered by `position`) |
 
-Legacy tables still in DB but unused by code: `reminders`, `exercise_log`, `action_items`, `recurring_schedules`.
+Legacy tables still in DB but unused by code: `reminders`, `exercise_log`, `action_items`, `recurring_schedules`, `daily_checklist_items`.
 
 ## Key Concepts
 
@@ -95,16 +94,11 @@ The today list is a view over nags, not a new table — it's the unified surface
 - **Capture**: text `.. <thing>` (dot-dot-space, prefix-handled in `/sms`). Routed through the nag pipeline (`parse_user_sms("nag me to " + remainder)` → `_handle_create_nag`) so GPT parses any inline deadline/recurrence.
 - **Deadline follow-up**: if no deadline/cron is found, the new nag defaults to end-of-day (11pm) and a `PendingConfirmation(action_type="set_deadline")` is created. The next reply is parsed by `_apply_deadline_reply` (`intent_router.py`) — a time sets `deadline_at`, "none"/blank keeps the default.
 - **Daily items** = recurring nags on a daily cron — they reappear on the list every day; checking one off ends today's cycle (`_next_nag_cycle` → next day).
-- **Check-off**: text `<thing> done` → normal `acknowledge` flow (keyword prefilter → GPT fuzzy match → `execute_acknowledge`). Also a per-item "done" button on the front-page UI (`/nag/done/{id}`).
-- **UI**: `/` (the front page) shows "Today's List" (active nags due/scheduled today, via `context_engine.today_items`) above the `##` daily checklist.
+- **Check-off**: text `<thing> done` → normal `acknowledge` flow (keyword prefilter → GPT fuzzy match → `execute_acknowledge`). Also a per-item check-off checkbox on the front-page UI (`/nag/done/{id}`).
+- **UI**: `/` (the front page) is "Today's List" only (active nags due/scheduled today, via `context_engine.today_items`), each row a checkbox that checks the item off.
 
-### Checklists (`app/models.py: DailyChecklistItem, CheckList, CheckListItem`)
-Two separate checklist features, both handled by prefix shortcuts in `/sms` that bypass the GPT intent router (like `#help`).
-
-**Daily checklist** (`##` prefix, `DailyChecklistItem`):
-- Text `## <label>` adds a recurring item to the daily checklist
-- Items live forever; an item shows as "done" only if its `completed_at` is on today's local date (`ui.py: _is_done_today`), so checks reset each day
-- Viewed/toggled on the front-page (`/`) UI, below the today list
+### Checklists (`app/models.py: CheckList, CheckListItem`)
+Named, one-off lists handled by prefix shortcuts in `/sms` that bypass the GPT intent router (like `#help`). (The old `##` daily-checklist feature was removed — daily recurring nags on the today list cover that role; the `daily_checklist_items` table lingers as legacy.)
 
 **Named lists** (`#newlist` / `#updatelist` prefixes, `CheckList` + `CheckListItem`):
 - `#newlist <title>` then one item per subsequent line — creates a `CheckList` with `CheckListItem`s. Title is optional; if blank it defaults to `"List <Mon DD HH:MM AM/PM>"`. Items keep insertion order via `position`.
@@ -118,7 +112,7 @@ Twilio POST → /sms
   ├─ From KATHRYN_PHONE (+19739787648)? → Auto-create nag, send confirmation
   ├─ From != USER_PHONE? → Reject
   └─ From == USER_PHONE:
-       ├─ Prefix shortcuts (bypass GPT): "#help", "#newlist", "#updatelist", "##", ".. " (capture nag) → handle directly, return
+       ├─ Prefix shortcuts (bypass GPT): "#help", "#newlist", "#updatelist", ".. " (capture nag) → handle directly, return
        ├─ PendingConfirmation(set_deadline)? → parse reply → set deadline on the just-created nag, return
        ├─ PendingConfirmation exists? → Handle YES/NO → execute or decline
        └─ No pending confirmation:
@@ -182,4 +176,4 @@ Key settings: `DATABASE_URL`, `OPENAI_API_KEY`, `TWILIO_*`, `USER_PHONE`, `USER_
 - `with_for_update(skip_locked=True)` used in scheduler queries to prevent double-firing
 - `_random_nag_time()` picks a random 9am-5pm time when user doesn't specify one
 - Auto-nag phone (`+19739787648`) allows external systems to create nags at 2-hour intervals by texting
-- Every inbound SMS from the user hits OpenAI for intent parsing; no local pre-parsing (except prefix shortcuts: `.. `, `#help`, `#newlist`, `#updatelist`, `##`, `kk`)
+- Every inbound SMS from the user hits OpenAI for intent parsing; no local pre-parsing (except prefix shortcuts: `.. `, `#help`, `#newlist`, `#updatelist`, `kk`)
