@@ -52,6 +52,9 @@ def _render_page(body: str) -> HTMLResponse:
   .checklist input[type=checkbox] {{ width: 20px; height: 20px; margin-right: 12px; cursor: pointer; }}
   .checklist .label {{ flex: 1; font-size: 15px; }}
   .checklist .done .label {{ color: #777; text-decoration: line-through; }}
+  .checklist .item-body {{ flex: 1; display: flex; flex-direction: column; }}
+  .checklist li.with-meta {{ align-items: flex-start; }}
+  .checklist .meta {{ color: #888; font-size: 12px; margin-top: 2px; margin-left: 4px; }}
   .checklist form {{ margin: 0; }}
   .hint {{ color: #888; font-size: 12px; margin-bottom: 12px; }}
 </style>
@@ -78,7 +81,12 @@ def _render_today_nags(db) -> str:
     lis = ""
     for n in nags:
         label = _escape(n.label)
-        deadline = _fmt(n.deadline_at)
+        if n.deadline_at:
+            deadline = _fmt(n.deadline_at)
+        elif n.repeating:
+            deadline = "11:00 PM"
+        else:
+            deadline = "-"
         nextnag = _fmt(n.next_nag_at)
         sc = n.snooze_count or 0
         badge_color = "#d9534f" if sc > 2 else "#f0ad4e"
@@ -88,12 +96,14 @@ def _render_today_nags(db) -> str:
             f"border-radius:10px;padding:1px 7px;margin-left:6px\">💤 {sc}</span>"
             if sc else ""
         )
-        lis += f"""<li>
+        lis += f"""<li class="with-meta">
           <form method="post" action="/nag/done/{n.id}">
             <input type="checkbox" onchange="this.form.submit()">
           </form>
-          <span class="label">{label}</span>{snooze_badge}
-          <span style="color:#888;font-size:12px">due {deadline} · next {nextnag}</span>
+          <div class="item-body">
+            <div><span class="label">{label}</span>{snooze_badge}</div>
+            <div class="meta">due {deadline} · next {nextnag}</div>
+          </div>
         </li>"""
     return f"""<h2>Today's List ({len(nags)})</h2>{hint}<ul class="checklist">{lis}</ul>"""
 
