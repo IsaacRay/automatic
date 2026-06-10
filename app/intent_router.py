@@ -347,6 +347,7 @@ def execute_acknowledge(db: Session, payload: dict) -> str:
             nag.deadline_at = None
             nag.nag_count = 0
             nag.snooze_count = 0
+            nag.completed_at = now
             nag.next_nag_at = _next_nag_cycle(nag, now)
             db.commit()
             log.info("Acknowledged nag #%d: %s", nag.id, nag.label)
@@ -379,6 +380,7 @@ def execute_acknowledge_all(db: Session, payload: dict) -> str:
             nag.deadline_at = None
             nag.nag_count = 0
             nag.snooze_count = 0
+            nag.completed_at = now
             nag.next_nag_at = _next_nag_cycle(nag, now)
         else:
             nag.status = "deleted"
@@ -388,6 +390,19 @@ def execute_acknowledge_all(db: Session, payload: dict) -> str:
     total = len(active_nags)
     log.info("Acknowledged all: %d nags", len(active_nags))
     return f"Cleared all! Marked {total} items as done."
+
+
+def reopen_nag(db: Session, nag_id: int) -> None:
+    """Un-check a nag that was checked off today (UI uncheck). Clears the
+    completion and surfaces it on today's list again, due now."""
+    now = datetime.now(timezone.utc)
+    nag = db.query(NagSchedule).filter(NagSchedule.id == nag_id).first()
+    if not nag:
+        return
+    nag.status = "active"
+    nag.completed_at = None
+    nag.next_nag_at = now
+    db.commit()
 
 
 def _capture_acknowledge_undo(db: Session, matched_id: int, matched_type: str) -> dict:

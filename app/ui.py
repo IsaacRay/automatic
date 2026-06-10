@@ -70,16 +70,18 @@ def _render_page(body: str) -> HTMLResponse:
 
 def _render_today_nags(db) -> str:
     """Render the today list: active nags due/scheduled for today, with check-off."""
-    from app.context_engine import today_items
+    from app.context_engine import today_items, is_done_today
     now = datetime.now(timezone.utc)
     nags = today_items(db, now)
-    nags.sort(key=lambda n: (n.deadline_at or n.next_nag_at))
+    # Open items first (by deadline), checked-off items sink to the bottom.
+    nags.sort(key=lambda n: (is_done_today(n, now), n.deadline_at or n.next_nag_at))
     hint = "<p class='hint'>Text \".. &lt;thing&gt;\" to add an item. Reply \"&lt;thing&gt; done\" to check off.</p>"
     if not nags:
         return f"<h2>Today's List</h2>{hint}<p class='empty'>Nothing on the list today.</p>"
 
     lis = ""
     for n in nags:
+        done = is_done_today(n, now)
         label = _escape(n.label)
         if n.deadline_at:
             deadline = _fmt(n.deadline_at)
@@ -96,9 +98,11 @@ def _render_today_nags(db) -> str:
             f"border-radius:10px;padding:1px 7px;margin-left:6px\">💤 {sc}</span>"
             if sc else ""
         )
-        lis += f"""<li class="with-meta">
+        checked = "checked" if done else ""
+        done_class = " done" if done else ""
+        lis += f"""<li class="with-meta{done_class}">
           <form method="post" action="/nag/done/{n.id}">
-            <input type="checkbox" onchange="this.form.submit()">
+            <input type="checkbox" {checked} onchange="this.form.submit()">
           </form>
           <div class="item-body">
             <div><span class="label">{label}</span>{snooze_badge}</div>
@@ -110,10 +114,17 @@ def _render_today_nags(db) -> str:
 
 @app.post("/nag/done/{id}")
 def nag_done(id: int):
+    """Toggle a today-list item: check off if open, re-open if already done today."""
     db = SessionLocal()
     try:
-        from app.intent_router import execute_acknowledge
-        execute_acknowledge(db, {"matched_id": id, "matched_type": "nag"})
+        from app.intent_router import execute_acknowledge, reopen_nag
+        from app.context_engine import is_done_today
+        now = datetime.now(timezone.utc)
+        nag = db.query(NagSchedule).filter(NagSchedule.id == id).first()
+        if nag and is_done_today(nag, now):
+            reopen_nag(db, id)
+        else:
+            execute_acknowledge(db, {"matched_id": id, "matched_type": "nag"})
     finally:
         db.close()
     return RedirectResponse("/", status_code=303)

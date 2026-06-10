@@ -37,17 +37,30 @@ def set_user_context(db, text: str):
         db.add(AppState(key="user_context", value=payload))
 
 
+def is_done_today(nag, now: datetime) -> bool:
+    """True if the nag was checked off earlier today (local date)."""
+    if nag.completed_at is None:
+        return False
+    tz = ZoneInfo(USER_TIMEZONE)
+    return nag.completed_at.astimezone(tz).date() == now.astimezone(tz).date()
+
+
 def today_items(db, now: datetime) -> list:
-    """Active nags relevant to today: currently in a cycle, or whose next cycle
-    is scheduled for today (or earlier)."""
+    """Nags relevant to today: currently in a cycle, whose next cycle is
+    scheduled for today (or earlier), or checked off earlier today (so they
+    stay struck-through on the list until end of day)."""
     tz = ZoneInfo(USER_TIMEZONE)
     today = now.astimezone(tz).date()
-    nags = db.query(NagSchedule).filter(NagSchedule.status == "active").all()
+    # "deleted" one-offs can still be done-today, so include them and filter below.
+    nags = db.query(NagSchedule).filter(NagSchedule.status.in_(["active", "deleted"])).all()
     items = []
     for nag in nags:
+        done_today = is_done_today(nag, now)
+        if nag.status == "deleted" and not done_today:
+            continue
         in_cycle = nag.active_since is not None
         starts_today = nag.next_nag_at.astimezone(tz).date() <= today
-        if in_cycle or starts_today:
+        if in_cycle or starts_today or done_today:
             items.append(nag)
     return items
 
@@ -58,7 +71,9 @@ def evaluate_context(db) -> list[str]:
     now = datetime.now(timezone.utc)
     local_now = now.astimezone(ZoneInfo(USER_TIMEZONE))
 
-    items = today_items(db, now)
+    # Don't re-surface items already checked off today (they linger on the list
+    # only for display); only consider genuinely open ones.
+    items = [n for n in today_items(db, now) if not is_done_today(n, now)]
     if not items:
         return []
 
