@@ -70,11 +70,11 @@ def _render_page(body: str) -> HTMLResponse:
 
 def _render_today_nags(db) -> str:
     """Render the today list: active nags due/scheduled for today, with check-off."""
-    from app.context_engine import today_items, is_done_today
+    from app.context_engine import today_items, is_done_today, cycle_deadline
     now = datetime.now(timezone.utc)
     nags = today_items(db, now)
-    # Open items first (by deadline), checked-off items sink to the bottom.
-    nags.sort(key=lambda n: (is_done_today(n, now), n.deadline_at or n.next_nag_at))
+    # Open items first (by effective deadline), checked-off items sink to the bottom.
+    nags.sort(key=lambda n: (is_done_today(n, now), cycle_deadline(n, now) or n.next_nag_at))
     hint = "<p class='hint'>Text \".. &lt;thing&gt;\" to add an item. Reply \"&lt;thing&gt; done\" to check off.</p>"
     if not nags:
         return f"<h2>Today's List</h2>{hint}<p class='empty'>Nothing on the list today.</p>"
@@ -83,8 +83,9 @@ def _render_today_nags(db) -> str:
     for n in nags:
         done = is_done_today(n, now)
         label = _escape(n.label)
-        if n.deadline_at:
-            deadline = _fmt(n.deadline_at)
+        cd = cycle_deadline(n, now)
+        if cd:
+            deadline = _fmt(cd)
         elif n.repeating:
             deadline = "11:00 PM"
         else:

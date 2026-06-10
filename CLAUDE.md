@@ -56,7 +56,7 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
 - Past deadline: clamps to `min_interval_minutes`
 - Each nag message is GPT-generated with increasing urgency (LOW → MODERATE → HIGH → CRITICAL → OVERDUE)
 - One-shot nags start active immediately (`active_since=now` at creation)
-- Recurring nags: when a cycle starts at cron time, the **first nag is deferred by a random Zeno step** instead of firing at the exact cron minute, so daily items land at varied times through the day
+- Recurring nags: the **first nag fires at the cron start time**; follow-up nags are then spaced by the random Zeno interval toward the deadline. Items sharing a start time hit cycle-start in the same tick and **coalesce into one SMS**
 - Fallback static message on GPT failure
 
 **Global rate gate + coalescing** (`scheduler.py: fire_due_nags`):

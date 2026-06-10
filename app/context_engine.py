@@ -4,7 +4,7 @@ scheduler's gate/coalescer sends them."""
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from app.models import NagSchedule, AppState
@@ -43,6 +43,29 @@ def is_done_today(nag, now: datetime) -> bool:
         return False
     tz = ZoneInfo(USER_TIMEZONE)
     return nag.completed_at.astimezone(tz).date() == now.astimezone(tz).date()
+
+
+def cycle_deadline(nag, now: datetime) -> datetime:
+    """For a repeating item with no explicit deadline_at, derive today's
+    deadline from this cycle: today's cron start time + deadline_offset_minutes.
+    Returns a UTC datetime, or None if not computable."""
+    if nag.deadline_at is not None:
+        return nag.deadline_at
+    if not (nag.repeating and nag.cron_expression and nag.deadline_offset_minutes):
+        return None
+    from croniter import croniter
+    tz = ZoneInfo(nag.timezone or USER_TIMEZONE)
+    local_now = now.astimezone(tz)
+    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        # First cron fire on or after midnight today.
+        start_local = croniter(nag.cron_expression, day_start - timedelta(seconds=1)).get_next(datetime)
+    except (ValueError, KeyError):
+        return None
+    if start_local.date() != local_now.date():
+        return None  # cron doesn't fire today
+    deadline_local = start_local + timedelta(minutes=nag.deadline_offset_minutes)
+    return deadline_local.astimezone(timezone.utc)
 
 
 def today_items(db, now: datetime) -> list:

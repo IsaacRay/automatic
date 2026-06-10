@@ -187,17 +187,12 @@ def fire_due_nags(db):
                 nag.nag_count = 0
                 nag.snooze_count = 0
                 if nag.repeating and nag.deadline_offset_minutes is not None:
-                    # Recurring nag: deadline is computed fresh each cycle
+                    # Recurring nag: deadline is computed fresh each cycle.
                     nag.deadline_at = now + timedelta(minutes=nag.deadline_offset_minutes)
-                    # Don't fire at the exact cron time — defer the first nag by a
-                    # random Zeno step so daily items land at varied times through
-                    # the day rather than all bursting at cycle start.
-                    interval = _compute_deadline_interval(nag, now)
-                    nag.next_nag_at = now + timedelta(minutes=interval)
-                    db.commit()
-                    log.info("Nag #%d cycle start, first nag in %dm: %s", nag.id, interval, nag.label)
-                    continue
-                # One-shot nag: deadline_at was set at creation — leave it alone
+                # Fire the first nag now, at the cycle start time. Items sharing a
+                # start time hit this in the same tick and coalesce into one SMS.
+                # Follow-up nags are spaced by the random Zeno interval, set after
+                # sending below.
                 db.commit()
 
             # Quiet hours gate — applies to all nags
