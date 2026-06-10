@@ -66,6 +66,9 @@ QUIET_HOURS_START = int(os.environ.get("QUIET_HOURS_START", "0"))   # midnight
 QUIET_HOURS_END = int(os.environ.get("QUIET_HOURS_END", "6"))       # 6 AM
 DEFAULT_MIN_INTERVAL = int(os.environ.get("DEFAULT_MIN_INTERVAL", "5"))
 DEFAULT_MAX_INTERVAL = int(os.environ.get("DEFAULT_MAX_INTERVAL", "1440"))
+# Global floor between any two outbound nag SMS (minutes). At most one nag SMS
+# per this window; items due in the same window coalesce into a single message.
+GLOBAL_NAG_MIN_GAP = int(os.environ.get("GLOBAL_NAG_MIN_GAP", "5"))
 
 # Basement light webhooks (IFTTT)
 BASEMENT_LIGHT_ON = os.environ.get("BASEMENT_LIGHT_ON", "")

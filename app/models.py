@@ -10,17 +10,15 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
-class Reminder(Base):
-    __tablename__ = "reminders"
+class ScheduledFlash(Base):
+    """A one-time basement-light flash scheduled for a specific time
+    ("flash lights at 9pm"). Fired by the scheduler, then marked done."""
+    __tablename__ = "scheduled_flashes"
 
     id = Column(Integer, primary_key=True)
     user_phone = Column(String(20), nullable=False, index=True)
-    label = Column(Text, nullable=False)
+    label = Column(Text, nullable=True)
     fire_at = Column(DateTime(timezone=True), nullable=False, index=True)
-    message = Column(Text, nullable=False)
-    parent_event_id = Column(String(64), nullable=True)
-    cron_expression = Column(String(100), nullable=True)
-    timezone = Column(String(50), nullable=True, default="America/New_York")
     status = Column(String(20), nullable=False, default="pending")
     sent_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
@@ -53,6 +51,7 @@ class NagSchedule(Base):
     next_nag_at = Column(DateTime(timezone=True), nullable=False, index=True)
     active_since = Column(DateTime(timezone=True), nullable=True)
     nag_count = Column(Integer, nullable=False, default=0)
+    snooze_count = Column(Integer, nullable=False, default=0)
     repeating = Column(Boolean, nullable=False, default=False)
     anchor_to_completion = Column(Boolean, nullable=False, default=False)
     cycle_months = Column(Integer, nullable=True)
@@ -82,18 +81,6 @@ class AppState(Base):
     key = Column(String(100), primary_key=True)
     value = Column(Text, nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-
-
-class ExerciseLog(Base):
-    __tablename__ = "exercise_log"
-
-    id = Column(Integer, primary_key=True)
-    user_phone = Column(String(20), nullable=False, index=True)
-    activity = Column(String(50), nullable=False)      # "run", "bike", "indoor bike"
-    duration_minutes = Column(Integer, nullable=True)
-    distance_miles = Column(Float, nullable=True)
-    notes = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 class BlockedPhoto(Base):

@@ -4,16 +4,16 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests as http_requests
 from fastapi import FastAPI, Form, Request, Response
 
 from app.database import SessionLocal
-from app.models import SmsLog, PendingConfirmation, DailyChecklistItem, CheckList, CheckListItem
+from app.models import SmsLog, PendingConfirmation, DailyChecklistItem, CheckList, CheckListItem, NagSchedule
 from app.config import USER_PHONE, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent, undo_reschedule, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag, _handle_help
+from app.intent_router import handle_intent, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag, _handle_help, _apply_deadline_reply
 from app.twilio_client import send_sms
 
 PHOTOS_DIR = "/app/photos"
@@ -161,6 +161,58 @@ async def incoming_sms(request: Request):
             db.close()
         return Response(content=EMPTY_TWIML, media_type="application/xml")
 
+    # Capture a new today-list item if prefixed with ".. " (dot-dot-space).
+    # Routes through the nag pipeline so GPT can parse any inline deadline;
+    # if none is found, ask for one via a set_deadline confirmation.
+    if stripped.startswith(".."):
+        remainder = stripped[2:].strip()
+        db = SessionLocal()
+        try:
+            db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+            db.commit()
+            if not remainder:
+                reply = "What should I add? Text '.. <thing>'."
+            else:
+                parsed = parse_user_sms("nag me to " + remainder)
+                data = parsed.get("data", {})
+                data["_raw_message"] = remainder
+                data.setdefault("label", remainder)
+                has_deadline = bool(
+                    data.get("deadline_at")
+                    or data.get("cron_expression")
+                    or data.get("deadline_offset_minutes")
+                )
+                reply = _handle_create_nag(db, data)
+                if not has_deadline:
+                    newest = db.query(NagSchedule).filter(
+                        NagSchedule.user_phone == USER_PHONE,
+                        NagSchedule.status == "active",
+                    ).order_by(NagSchedule.created_at.desc()).first()
+                    if newest:
+                        # Stay dormant until the deadline question is answered. If
+                        # never answered, it naturally wakes at its end-of-day default.
+                        newest.active_since = None
+                        if newest.deadline_at:
+                            newest.next_nag_at = newest.deadline_at
+                        else:
+                            newest.next_nag_at = datetime.now(timezone.utc) + timedelta(days=1)
+                        db.add(PendingConfirmation(
+                            user_phone=USER_PHONE,
+                            action_type="set_deadline",
+                            payload=json.dumps({"nag_id": newest.id}),
+                        ))
+                        db.commit()
+                        reply += " When's the deadline? Reply a time, or 'none' for end of day."
+            result = send_sms(USER_PHONE, reply)
+            db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=result.get("sid", "")))
+            db.commit()
+        except Exception:
+            log.exception("Error capturing list item")
+            db.rollback()
+        finally:
+            db.close()
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
+
     # Create a new checklist if prefixed with "#newlist"
     if stripped.lower().startswith("#newlist"):
         remainder = stripped[len("#newlist"):]
@@ -281,6 +333,22 @@ async def incoming_sms(request: Request):
             PendingConfirmation.expires_at > now,
         ).order_by(PendingConfirmation.created_at.desc()).first()
 
+        if pending and pending.action_type == "set_deadline":
+            # Reply to a ".. " capture's "When's the deadline?" follow-up.
+            payload = json.loads(pending.payload)
+            db.delete(pending)
+            db.commit()
+            reply = _apply_deadline_reply(db, payload.get("nag_id"), Body.strip())
+            result = send_sms(USER_PHONE, reply)
+            db.add(SmsLog(
+                direction="outbound",
+                phone=USER_PHONE,
+                body=reply,
+                twilio_sid=result.get("sid", ""),
+            ))
+            db.commit()
+            return Response(content=EMPTY_TWIML, media_type="application/xml")
+
         if pending:
             stripped = Body.strip().lower()
 
@@ -293,7 +361,6 @@ async def incoming_sms(request: Request):
 
                 # User wants to undo — dispatch to the appropriate undo function
                 undo_handlers = {
-                    "undo_reschedule": undo_reschedule,
                     "undo_cancel": undo_cancel,
                     "undo_acknowledge": undo_acknowledge,
                     "undo_acknowledge_all": undo_acknowledge_all,

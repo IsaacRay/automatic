@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.database import engine, Base, SessionLocal
-from app.models import Reminder, NagSchedule, DailyChecklistItem, CheckList, CheckListItem
+from app.models import NagSchedule, DailyChecklistItem, CheckList, CheckListItem
 from app.config import USER_TIMEZONE
 
 app = FastAPI(title="ADHD Bot UI")
@@ -58,7 +58,7 @@ def _render_page(body: str) -> HTMLResponse:
 </head>
 <body>
 <h1>ADHD Bot</h1>
-<nav><a href="/">Lists</a> <a href="/today">Today</a> <a href="/reminders">Reminders</a> <a href="/nags">Nags</a></nav>
+<nav><a href="/">Today</a> <a href="/lists">Lists</a> <a href="/nags">Nags</a></nav>
 {body}
 </body>
 </html>"""
@@ -79,14 +79,59 @@ def _is_done_today(item: DailyChecklistItem) -> bool:
     return item.completed_at.astimezone(ZoneInfo(USER_TIMEZONE)).date() == _local_today()
 
 
-@app.get("/today", response_class=HTMLResponse)
+def _render_today_nags(db) -> str:
+    """Render the today list: active nags due/scheduled for today, with check-off."""
+    from app.context_engine import today_items
+    now = datetime.now(timezone.utc)
+    nags = today_items(db, now)
+    nags.sort(key=lambda n: (n.deadline_at or n.next_nag_at))
+    hint = "<p class='hint'>Text \".. &lt;thing&gt;\" to add an item. Reply \"&lt;thing&gt; done\" to check off.</p>"
+    if not nags:
+        return f"<h2>Today's List</h2>{hint}<p class='empty'>Nothing on the list today.</p>"
+
+    lis = ""
+    for n in nags:
+        label = _escape(n.label)
+        deadline = _fmt(n.deadline_at)
+        nextnag = _fmt(n.next_nag_at)
+        sc = n.snooze_count or 0
+        badge_color = "#d9534f" if sc > 2 else "#f0ad4e"
+        snooze_badge = (
+            f"<span title='Snoozed {sc} time{'s' if sc != 1 else ''}' "
+            f"style=\"background:{badge_color};color:#fff;font-size:11px;font-weight:bold;"
+            f"border-radius:10px;padding:1px 7px;margin-left:6px\">💤 {sc}</span>"
+            if sc else ""
+        )
+        lis += f"""<li>
+          <form method="post" action="/nag/done/{n.id}">
+            <button class="btn" style="background:#5cb85c" onclick="return confirm('Mark done?')">done</button>
+          </form>
+          <span class="label">{label}</span>{snooze_badge}
+          <span style="color:#888;font-size:12px">due {deadline} · next {nextnag}</span>
+        </li>"""
+    return f"""<h2>Today's List ({len(nags)})</h2>{hint}<ul class="checklist">{lis}</ul>"""
+
+
+@app.post("/nag/done/{id}")
+def nag_done(id: int):
+    db = SessionLocal()
+    try:
+        from app.intent_router import execute_acknowledge
+        execute_acknowledge(db, {"matched_id": id, "matched_type": "nag"})
+    finally:
+        db.close()
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/", response_class=HTMLResponse)
 def checklist_page():
     db = SessionLocal()
     try:
+        nags_block = _render_today_nags(db)
         rows = db.query(DailyChecklistItem).order_by(DailyChecklistItem.created_at.asc()).all()
         hint = "<p class='hint'>Text \"##&lt;item&gt;\" to add. Resets at midnight.</p>"
         if not rows:
-            return _render_page(f"<h2>Today</h2>{hint}<p class='empty'>No items yet.</p>")
+            return _render_page(f"{nags_block}<h2>Daily Checklist</h2>{hint}<p class='empty'>No items yet.</p>")
 
         lis = ""
         for r in rows:
@@ -104,7 +149,8 @@ def checklist_page():
               </form>
             </li>"""
 
-        body = f"""<h2>Today ({len(rows)})</h2>
+        body = f"""{nags_block}
+        <h2>Daily Checklist ({len(rows)})</h2>
         {hint}
         <ul class="checklist">{lis}</ul>"""
         return _render_page(body)
@@ -122,7 +168,7 @@ def toggle_checklist(id: int):
             db.commit()
     finally:
         db.close()
-    return RedirectResponse("/today", status_code=303)
+    return RedirectResponse("/", status_code=303)
 
 
 @app.post("/checklist/delete/{id}")
@@ -133,7 +179,7 @@ def delete_checklist_item(id: int):
         db.commit()
     finally:
         db.close()
-    return RedirectResponse("/today", status_code=303)
+    return RedirectResponse("/", status_code=303)
 
 
 def _escape(s: str) -> str:
@@ -181,7 +227,7 @@ def _render_list_block(lst: CheckList, items, heading_level: int = 2, show_resur
     return f"<{h}>{title_html}</{h}>{actions}{body_inner}"
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/lists", response_class=HTMLResponse)
 def lists_page():
     db = SessionLocal()
     try:
@@ -220,7 +266,7 @@ def toggle_list_item(id: int):
             db.commit()
     finally:
         db.close()
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/lists", status_code=303)
 
 
 @app.post("/lists/delete/{id}")
@@ -232,7 +278,7 @@ def delete_list(id: int):
         db.commit()
     finally:
         db.close()
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/lists", status_code=303)
 
 
 @app.post("/lists/resurrect/{id}")
@@ -245,73 +291,7 @@ def resurrect_list(id: int):
             db.commit()
     finally:
         db.close()
-    return RedirectResponse("/", status_code=303)
-
-
-@app.get("/reminders", response_class=HTMLResponse)
-def reminders_page():
-    db = SessionLocal()
-    try:
-        rows = db.query(Reminder).order_by(Reminder.fire_at.desc()).all()
-        if not rows:
-            return _render_page("<h2>Reminders</h2><p class='empty'>No reminders.</p>")
-
-        trs = ""
-        for r in rows:
-            cron = r.cron_expression or "-"
-            trs += f"""<tr>
-              <td>{r.id}</td>
-              <td>{r.label}</td>
-              <td>{r.message[:80]}</td>
-              <td>{cron}</td>
-              <td>{_fmt(r.fire_at)}</td>
-              <td class="status-{r.status}">{r.status}</td>
-              <td>{_fmt(r.sent_at)}</td>
-              <td><form method="post" action="/delete/reminder/{r.id}" style="margin:0">
-                <button class="btn" onclick="return confirm('Delete?')">del</button>
-              </form></td>
-            </tr>"""
-
-        cleanup_btn = ""
-        done_count = sum(1 for r in rows if r.status in ("dismissed", "cancelled", "sent") and not r.cron_expression)
-        if done_count:
-            cleanup_btn = f"""<form method="post" action="/delete/reminders/completed" style="margin:0;display:inline">
-              <button class="btn-cleanup" onclick="return confirm('Delete {done_count} completed/cancelled/sent reminders?')">Delete all completed/cancelled ({done_count})</button>
-            </form>"""
-
-        table = f"""<h2>Reminders ({len(rows)})</h2>
-        {cleanup_btn}
-        <table><tr><th>ID</th><th>Label</th><th>Message</th><th>Cron</th><th>Next Fire</th><th>Status</th><th>Sent</th><th></th></tr>
-        {trs}</table>"""
-        return _render_page(table)
-    finally:
-        db.close()
-
-
-@app.post("/delete/reminder/{id}")
-def delete_reminder(id: int):
-    db = SessionLocal()
-    try:
-        db.query(Reminder).filter(Reminder.id == id).delete()
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/reminders", status_code=303)
-
-
-@app.post("/delete/reminders/completed")
-def delete_completed_reminders():
-    db = SessionLocal()
-    try:
-        # Only clean up non-recurring sent/dismissed/cancelled reminders
-        db.query(Reminder).filter(
-            Reminder.status.in_(("dismissed", "cancelled", "sent")),
-            Reminder.cron_expression == None,
-        ).delete(synchronize_session=False)
-        db.commit()
-    finally:
-        db.close()
-    return RedirectResponse("/reminders", status_code=303)
+    return RedirectResponse("/lists", status_code=303)
 
 
 @app.get("/nags", response_class=HTMLResponse)

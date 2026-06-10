@@ -51,10 +51,7 @@ def run_migrations():
                 "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS deadline_offset_minutes INTEGER"
             ))
             conn.execute(text(
-                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS cron_expression VARCHAR(100)"
-            ))
-            conn.execute(text(
-                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS timezone VARCHAR(50) DEFAULT 'America/New_York'"
+                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS snooze_count INTEGER NOT NULL DEFAULT 0"
             ))
             conn.execute(text("ALTER TABLE nag_schedules DROP COLUMN IF EXISTS max_interval_minutes"))
             conn.execute(text("ALTER TABLE sms_log DROP COLUMN IF EXISTS related_type"))

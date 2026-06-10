@@ -48,24 +48,16 @@ def parse_user_sms(message: str) -> dict:
 Current date/time: {now_local.strftime("%A, %B %d, %Y %I:%M %p")} ({USER_TIMEZONE})
 
 Return a JSON object with:
-- "intent": one of "create_reminder", "create_nag", "reschedule", "acknowledge", "cancel", "snooze", "list", "briefing", "help", "log_exercise", "exercise_history", "unknown"
+- "intent": one of "create_nag", "flash_lights", "acknowledge", "cancel", "snooze", "list", "briefing", "help", "context_update", "unknown"
 - "data": intent-specific fields (see below)
 
 Intent-specific data:
 
-**create_reminder**: The user wants to be reminded about something — either once at a specific time, or on a recurring schedule.
-- "label": short description of the event/reminder
-- "message": the SMS text to send (e.g., "Reminder: Dr Watson appointment")
-- "reminders": array of objects, each with:
-  - "message": the SMS text to send
-  - "fire_at": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC)
-For meetings/events: create TWO reminders — a prep reminder 30 minutes before AND the event reminder. Use parent_event_id to link them.
-  - The 30-minute prep reminder message should say "Heads up — [event] at [event time, e.g. 2:00 PM]" so the user knows what's coming and when.
-  - The event-time reminder message should say "Time for [event]" or similar.
-- "parent_event_id": a unique string to group related reminders (use format "evt_<timestamp>")
-- "cron_expression": optional, 5-field cron expression for recurring reminders (minute hour day month weekday). Set this when the user wants to be reminded on a recurring schedule (e.g., "every Tuesday at 3pm" → "0 15 * * 2", "every day at 5pm" → "0 17 * * *", "every weekday at 9am" → "0 9 * * 1-5"). Do NOT set this for one-time reminders. When cron_expression is set, do NOT use parent_event_id or create prep/event pairs — just provide a single "message" field with the reminder text.
+**flash_lights**: The user wants the basement lights to flash at a specific time. Trigger words: "flash lights", "flash the lights", "blink the lights".
+- "fire_at": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC).
+- "label": short description (default "Light flash").
 
-**create_nag**: The user wants to be nagged repeatedly until they reply "done". Trigger words: "nag", "keep reminding", "bug me", "pester", "nag me".
+**create_nag**: The user wants to be nagged repeatedly until they reply "done". This is the DEFAULT for anything that needs doing by some time — most "remind me to X" / "I need to X by Y" messages are nags. Trigger words: "nag", "keep reminding", "bug me", "pester", "nag me", "remind me to", "I need to".
 
 EVERY nag is a deadline nag. The system ramps up nag frequency automatically (Zeno curve: interval = 1/3 of remaining time, clamped to a floor) as the deadline approaches. You do NOT emit a nag interval — just the deadline timing.
 
@@ -115,17 +107,11 @@ Fields:
 - "keyword": optional keyword to match a specific item (null to mark most recent)
 - "all": boolean, true if the user says "done all" or "clear all"
 
-**cancel**: The user wants to cancel/delete a reminder, recurring schedule, nag, or action item. Trigger words: "cancel", "delete", "remove", "nevermind", "nvm", "forget it", "stop", "kill".
+**cancel**: The user wants to cancel/delete a nag/to-do item entirely. Trigger words: "cancel", "delete", "remove", "nevermind", "nvm", "forget it", "stop", "kill".
 Use this intent when the user wants to get rid of something they no longer need — different from "acknowledge" which means they completed the task.
-- "keyword": optional keyword to match a specific item (null to cancel most recent pending reminder)
-- "type": optional — "reminder", "recurring", "nag", or "action" to narrow scope. If not specified, searches all types. Only set this if you're very confident about the type — when in doubt, leave it null to search everything.
+- "keyword": optional keyword to match a specific item (null to cancel the most recent item)
 
-**reschedule**: The user wants to move an existing reminder/event to a new time. Trigger words: "reschedule", "move", "change to", "push to", "bump to", "actually make it".
-- "keyword": keyword to match the existing reminder/event
-- "new_time": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC)
-- "original_message": the user's original message text verbatim (needed for fuzzy matching)
-
-**snooze**: The user wants to delay reminders or nags. Trigger words: "snooze", "later", "not now", "remind me later".
+**snooze**: The user wants to delay a nag. Trigger words: "snooze", "later", "not now", "remind me later".
 - "duration_minutes": how long to snooze in minutes (default 60). Convert natural language durations: "a day"=1440, "an hour"=60, "2 hours"=120, "30 min"=30, "a week"=10080. Maximum 1440 (24 hours).
 - "keyword": optional keyword to match a specific item
 
@@ -139,15 +125,8 @@ No additional data needed.
 **briefing**: The user wants their morning briefing (weather, calendar, market summary). Trigger words: "briefing", "morning briefing", "brief me", "what's my day look like", "daily briefing", "today's briefing".
 No additional data needed.
 
-**log_exercise**: The user reports completing an exercise activity. Trigger words/patterns: "I ran", "I biked", "went for a run", "did a bike ride", "rode the bike", "indoor bike", "exercised", "I walked", "went for a walk".
-- "activity": string — "run", "outdoor bike", "indoor bike", "walk", etc.
-- "duration_minutes": integer or null
-- "distance_miles": float or null
-- "notes": string or null — any extra context
-
-**exercise_history**: The user asks about past exercise activities. Trigger words: "exercise history", "what exercise", "my activities", "workouts between", "how much did I exercise", "my runs", "my workouts".
-- "start_date": ISO date string (YYYY-MM-DD) — convert relative dates like "last week" or "this week" using current date
-- "end_date": ISO date string (YYYY-MM-DD)
+**context_update**: The user is telling you where they are, where they're headed, or what they're about to do — NOT asking for anything. Trigger examples: "at the office", "heading to Target", "home for the night", "leaving work", "about to start dinner", "in the car", "at the gym". These are plain statements of location/activity/intent with no task, time, or command. Use this when the message is just situational context that could make some to-do items more relevant right now.
+- "text": the user's statement, verbatim.
 
 **unknown**: You can't determine the intent.
 - "original": the original message text
@@ -210,73 +189,72 @@ def generate_deadline_nag_message(nag, now) -> str:
     return content.strip()
 
 
-def deduce_reschedule_target(user_message: str, items: list[dict], *, parsed_new_time: str = "") -> dict:
-    """Use GPT-4o to fuzzy-match a reschedule request against pending items.
+def generate_nag_plan(labels: list[str]) -> str:
+    """Short GPT 'plan' line for a coalesced nag SMS listing several due tasks.
+
+    Returns one terse sentence suggesting an order/approach, or "" on any error
+    (the caller omits the plan line and just sends the numbered list).
+    """
+    if not labels:
+        return ""
+    try:
+        system_prompt = (
+            "You are an ADHD accountability buddy. The user has several tasks due now. "
+            "In ONE short sentence (under 120 chars, no emojis or hashtags), suggest how to "
+            "knock them out — e.g. which to do first or how to batch them. Be concrete and brisk. "
+            "Start with 'Plan:'."
+        )
+        content = _chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Tasks due now:\n" + "\n".join(f"- {l}" for l in labels)},
+            ],
+            temperature=0.7,
+        )
+        return content.strip()
+    except Exception:
+        return ""
+
+
+def select_relevant_items(items: list[dict], context_text: str, local_now: datetime) -> list[int]:
+    """Pick which open to-do items are worth surfacing right now given the user's
+    current context (location/intent), time of day, and each item's nature.
 
     Args:
-        user_message: The user's raw SMS text.
-        items: List of dicts with keys: id, type ("reminder"|"recurring"),
-               label, fire_at (ISO string).
-        parsed_new_time: Optional ISO 8601 UTC time already parsed from the user's
-                         message by the intent parser. Use as a strong hint.
+        items: list of dicts with keys 'id' and 'label'.
+        context_text: the user's latest location/intent statement (may be empty).
+        local_now: timezone-aware current local time.
 
-    Returns a dict with matched_id, matched_type, new_time, description
-    or matched_id=None if no match.
+    Returns a list of selected item ids (possibly empty). Returns [] on error.
     """
-    items_text = json.dumps(items, indent=2)
-
+    if not items:
+        return []
     try:
-        from zoneinfo import ZoneInfo
-        now_local = datetime.now(ZoneInfo(USER_TIMEZONE))
-    except Exception:
-        now_local = datetime.now()
+        items_text = json.dumps([{"id": i["id"], "label": i["label"]} for i in items], indent=2)
+        system_prompt = f"""You decide which of the user's open to-do items are worth pinging them about RIGHT NOW.
 
-    time_hint = ""
-    if parsed_new_time:
-        time_hint = f"\nThe user's intended new time has already been parsed as: {parsed_new_time}. Use this as the new_time unless it seems clearly wrong.\n"
+Current local time: {local_now.strftime("%A, %B %d, %Y %I:%M %p")} ({USER_TIMEZONE})
+User's current context (where they are / what they're doing / heading): "{context_text or "(none given)"}"
 
-    system_prompt = f"""You are helping match a reschedule request to the correct item. The user has ADHD and texts very casually — expect abbreviations, typos, partial words, and terse messages.
-
-Current date/time: {now_local.strftime("%A, %B %d, %Y %I:%M %p")} ({USER_TIMEZONE})
-
-The user sent this message wanting to reschedule something:
-"{user_message}"
-{time_hint}
-Here are their pending items:
+Open items:
 {items_text}
 
-MATCHING STRATEGY — try ALL of these, pick the best overall match:
-1. Substring/keyword: does ANY word in the user's message appear in the item's label? (e.g., "move dentist" matches "dentist appointment")
-2. Semantic/synonym: does the user's meaning match? (e.g., "push the doc appt" matches "dentist appointment", "move standup" matches "daily standup meeting")
-3. Time-based: does the user reference a time that matches an item's fire_at? (e.g., "move the 3pm thing" matches item firing at 3:00 PM)
-4. Abbreviation/shorthand: expand common abbreviations (e.g., "mtg"=meeting, "appt"=appointment, "dr"=doctor, "dent"=dentist, "esub"=Esub)
-5. Fuzzy/typo: allow off-by-one typos and phonetic similarity (e.g., "meating" matches "meeting")
+Choose ONLY items that this moment genuinely fits — e.g. an errand when they're near a store, a home task when they're home for the evening, a work task during work hours. When the context is empty or nothing clearly fits, return an empty list (don't force it).
 
-PRIORITY — match quality is king, item type/status is a tiebreaker:
-1. BEST keyword overlap wins — if the user's words appear literally in one item's label but not another's, pick that item regardless of type.
-2. More keyword overlap > less overlap.
-3. Exact substring > semantic similarity — a word literally appearing in a label beats a loosely related concept.
-4. Only use item type/status or time proximity as a tiebreaker when keyword match quality is equal.
-If only ONE item exists, match it unless the user's description actively contradicts it.
-
-Return a JSON object with:
-- "matched_id": the integer ID of the matched item (as an integer, not a string), or null if no reasonable match
-- "matched_type": "reminder" or "recurring"
-- "new_time": ISO 8601 datetime string in {USER_TIMEZONE} local time (do NOT convert to UTC)
-- "description": a short human-readable summary like "Dentist appointment → Wed Mar 5 3:00 PM"
-
-If you cannot determine a match, return {{"matched_id": null}}.
-Err on the side of matching — a false match can be rejected by the user via confirmation, but a false null means they have to retype."""
-
-    content = _chat(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=0.3,
-        json_mode=True,
-    )
-    return json.loads(content)
+Return JSON: {{"ids": [<selected item ids>]}}."""
+        content = _chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Which items fit right now?"},
+            ],
+            temperature=0.2,
+            json_mode=True,
+        )
+        result = json.loads(content)
+        ids = result.get("ids", [])
+        return [int(i) for i in ids if isinstance(i, (int, str)) and str(i).isdigit()]
+    except Exception:
+        return []
 
 
 def deduce_acknowledge_target(user_message: str, items: list[dict]) -> dict:
