@@ -202,7 +202,12 @@ async def incoming_sms(request: Request):
                             payload=json.dumps({"nag_id": newest.id}),
                         ))
                         db.commit()
-                        reply += " When's the deadline? Reply a time, or 'none' for end of day."
+                        # Don't announce the placeholder deadline / first-nag time —
+                        # just ask for the deadline (it's dormant until answered).
+                        reply = (
+                            f'Added "{newest.label}" to today\'s list. '
+                            "When's the deadline? Reply a time, or 'none' for end of day."
+                        )
             result = send_sms(USER_PHONE, reply)
             db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=result.get("sid", "")))
             db.commit()

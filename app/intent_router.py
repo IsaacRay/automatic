@@ -218,7 +218,9 @@ def handle_intent(db: Session, parsed: dict) -> str:
 
 def _apply_deadline_reply(db: Session, nag_id: int, reply_text: str) -> str:
     """Apply the user's reply to a 'When's the deadline?' follow-up (from a `.. `
-    capture). Parses a time phrase; 'none'/blank keeps the end-of-day default."""
+    capture). Accepts a plain time ("3pm"), a recurrence ("daily at 3pm",
+    "monthly on the 2nd, anchored to completion"), or 'none'/blank to keep the
+    end-of-day default. Reconfigures the dormant nag accordingly and wakes it."""
     nag = db.query(NagSchedule).filter(
         NagSchedule.id == nag_id, NagSchedule.status == "active"
     ).first()
@@ -226,29 +228,63 @@ def _apply_deadline_reply(db: Session, nag_id: int, reply_text: str) -> str:
         return "That item's no longer around."
     now = datetime.now(timezone.utc)
 
-    def _activate():
-        # Wake the dormant nag so it starts nagging from now (Zeno toward deadline).
+    def _activate_eod():
+        # Wake the dormant one-shot so it nags from now (Zeno toward end of day).
         nag.active_since = now
         nag.nag_count = 0
         nag.next_nag_at = now
 
     low = reply_text.strip().lower()
     if low in {"none", "no", "skip", "eod", "end of day", ""}:
-        _activate()
+        _activate_eod()
         db.commit()
         return f'Got it — "{nag.label}" due by end of day.'
+
     try:
         from app.openai_client import parse_user_sms
-        parsed = parse_user_sms("set a nag with deadline " + reply_text)
-        dstr = parsed.get("data", {}).get("deadline_at")
-        if dstr:
-            nag.deadline_at = _parse_dt(dstr)
-            _activate()
-            db.commit()
-            return f'Deadline set: "{nag.label}" by {_format_time(nag.deadline_at)}.'
+        parsed = parse_user_sms("nag me to " + nag.label + " " + reply_text)
+        data = parsed.get("data", {})
     except Exception:
-        pass
-    _activate()
+        data = {}
+
+    cron_expr = data.get("cron_expression") or None
+    anchor = bool(data.get("anchor_to_completion", False))
+    repeating = anchor or bool(cron_expr)
+
+    if repeating:
+        if not cron_expr:
+            cron_expr = "0 12 * * *"
+        if _validate_cron_expr(cron_expr):
+            _activate_eod()
+            db.commit()
+            return f'Couldn\'t read that schedule — "{nag.label}" stays due end of day, starting now.'
+        # Reconfigure the captured item as a recurring nag.
+        nag.cron_expression = cron_expr
+        nag.repeating = True
+        nag.anchor_to_completion = anchor
+        nag.cycle_months = data.get("cycle_months")
+        nag.cycle_days = data.get("cycle_days")
+        nag.recurrence_description = data.get("recurrence_description")
+        nag.deadline_offset_minutes = data.get("deadline_offset_minutes") or _default_offset_to_eleven_pm(cron_expr)
+        nag.min_interval_minutes = data.get("min_interval_minutes")
+        nag.deadline_at = None  # recomputed each cycle by the scheduler
+        nag.next_nag_at = _next_cron_fire(cron_expr, USER_TIMEZONE)  # first nag at start time
+        nag.active_since = None  # dormant until the cron start fires
+        nag.nag_count = 0
+        db.commit()
+        desc = nag.recurrence_description or "recurring"
+        tail = ", anchored to completion" if anchor else ""
+        return f'Set: "{nag.label}" — {desc}{tail}. First: {_format_time(nag.next_nag_at)}.'
+
+    dstr = data.get("deadline_at")
+    if dstr:
+        nag.deadline_at = _parse_dt(dstr)
+        nag.repeating = False
+        _activate_eod()
+        db.commit()
+        return f'Deadline set: "{nag.label}" by {_format_time(nag.deadline_at)}.'
+
+    _activate_eod()
     db.commit()
     return f'Couldn\'t read that time — "{nag.label}" stays due end of day, starting now.'
 
