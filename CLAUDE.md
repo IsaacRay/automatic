@@ -65,7 +65,7 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
 
 **Context-aware surfacing** (`app/context_engine.py`):
 - The user texts plain location/intent ("heading to Target", "home for the night") → parsed as the `context_update` intent → stored in `app_state` under `user_context`
-- `evaluate_context(db)` asks GPT (`openai_client.py: select_relevant_items`) which open today-list items fit the moment (time of day + context + task type) and pulls their `next_nag_at` forward to now, so the gate/coalescer sends them
+- `evaluate_context(db)` asks GPT (`openai_client.py: select_relevant_items`) which open today-list items fit the moment (time of day + context + task type) and pulls their `next_nag_at` forward to now, so the gate/coalescer sends them. Only items already **in a nagging cycle** (`active_since` set) are eligible — a dormant item with a future scheduled start (e.g. a 4pm pill) is never accelerated by context
 - Runs immediately on a `context_update` and every ~10 min in the scheduler loop (so loose items still surface without context)
 
 **Quiet hours** (all nags):

@@ -94,9 +94,15 @@ def evaluate_context(db) -> list[str]:
     now = datetime.now(timezone.utc)
     local_now = now.astimezone(ZoneInfo(USER_TIMEZONE))
 
-    # Don't re-surface items already checked off today (they linger on the list
-    # only for display); only consider genuinely open ones.
-    items = [n for n in today_items(db, now) if not is_done_today(n, now)]
+    # Candidates for context surfacing:
+    #  - not already checked off today (those linger only for display)
+    #  - already in a nagging cycle (active_since set). A dormant item with a
+    #    future start time (e.g. a 4pm pill) is waiting for its scheduled time,
+    #    so we must NOT pull it forward just because the context fits now.
+    items = [
+        n for n in today_items(db, now)
+        if not is_done_today(n, now) and n.active_since is not None
+    ]
     if not items:
         return []
 
