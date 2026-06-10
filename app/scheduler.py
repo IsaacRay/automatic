@@ -335,23 +335,14 @@ def main():
         log.exception("Failed to send recovery notification")
 
     last_gmail_sync = 0.0
-    last_context_eval = 0.0
-    CONTEXT_EVAL_INTERVAL = 600  # ~10 min: surface context-relevant items even without a new context SMS
 
     while True:
         db = SessionLocal()
         try:
             fire_morning_briefing(db)
             fire_due_flashes(db)
-            # Context-aware surfacing runs before nags so pulled-forward items send this tick
-            now_ts = time.time()
-            if now_ts - last_context_eval >= CONTEXT_EVAL_INTERVAL:
-                try:
-                    from app.context_engine import evaluate_context
-                    evaluate_context(db)
-                except Exception:
-                    log.exception("Context evaluation failed")
-                last_context_eval = now_ts
+            # Context-aware surfacing runs only when the user sends a context SMS
+            # (handled in _handle_context_update), not on a timer.
             fire_due_nags(db)
         except Exception:
             log.exception("Scheduler tick error")

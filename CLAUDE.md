@@ -66,7 +66,7 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
 **Context-aware surfacing** (`app/context_engine.py`):
 - The user texts plain location/intent ("heading to Target", "home for the night") → parsed as the `context_update` intent → stored in `app_state` under `user_context`
 - `evaluate_context(db)` asks GPT (`openai_client.py: select_relevant_items`) which open today-list items fit the moment (time of day + context + task type) and pulls their `next_nag_at` forward to now, so the gate/coalescer sends them. Only items already **in a nagging cycle** (`active_since` set) are eligible — a dormant item with a future scheduled start (e.g. a 4pm pill) is never accelerated by context
-- Runs immediately on a `context_update` and every ~10 min in the scheduler loop (so loose items still surface without context)
+- Runs **only when the user sends a `context_update` SMS** (not on a timer), so context surfacing never overrides an item's own Zeno schedule on a loop. Items not surfaced by context still nag on their normal schedule
 
 **Quiet hours** (all nags):
 - No nags sent between `QUIET_HOURS_START` (default 0 = midnight) and `QUIET_HOURS_END` (default 6 = 6 AM) local time
@@ -125,8 +125,9 @@ Twilio POST → /sms
 Each tick (60s):
 1. `fire_morning_briefing()` — once/day at BRIEFING_TIME
 2. `fire_due_flashes()` — trigger any scheduled light flashes whose time has passed
-3. `evaluate_context()` — every ~10min: surface context-relevant today-list items (runs before nags so pulled-forward items send this tick)
-4. `fire_due_nags()` — nag state machine (cycle start/send/expire) + global 5-min gate + coalescing
+3. `fire_due_nags()` — nag state machine (cycle start/send/expire) + global 5-min gate + coalescing
+
+(`evaluate_context()` is **not** on the tick — it runs only when the user sends a `context_update` SMS, via `_handle_context_update`.)
 
 Every 30min: `run_gmail_sync()` → fetch emails → GPT extract action items → create nag schedules
 
