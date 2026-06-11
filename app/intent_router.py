@@ -242,7 +242,12 @@ def _apply_deadline_reply(db: Session, nag_id: int, reply_text: str) -> str:
 
     try:
         from app.openai_client import parse_user_sms
-        parsed = parse_user_sms("nag me to " + nag.label + " " + reply_text)
+        # Frame the reply as a deadline answer ("by <reply>"). The create_nag
+        # prompt only routes a time into deadline_at for "by X" phrasing — a bare
+        # time ("3pm", "noon") otherwise lands in first_nag_at (or nowhere), and
+        # we'd silently fall back to the 11pm default. Recurrence language
+        # ("daily at 3pm") still parses to a cron through the "by" prefix.
+        parsed = parse_user_sms("nag me to " + nag.label + " by " + reply_text)
         data = parsed.get("data", {})
     except Exception:
         data = {}
@@ -276,7 +281,9 @@ def _apply_deadline_reply(db: Session, nag_id: int, reply_text: str) -> str:
         tail = ", anchored to completion" if anchor else ""
         return f'Set: "{nag.label}" — {desc}{tail}. First: {_format_time(nag.next_nag_at)}.'
 
-    dstr = data.get("deadline_at")
+    # A time the user gives in answer to "When's the deadline?" is the deadline,
+    # even if GPT routed it to first_nag_at instead of deadline_at.
+    dstr = data.get("deadline_at") or data.get("first_nag_at")
     if dstr:
         nag.deadline_at = _parse_dt(dstr)
         nag.repeating = False
