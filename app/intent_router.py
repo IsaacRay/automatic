@@ -896,7 +896,9 @@ def start_snooze_negotiation(db: Session, raw_message: str) -> str:
     total_rounds = (match.get("snooze_count") or 0) + 1
 
     history = [{"role": "user", "content": raw_message or f"snooze {match['label']}"}]
-    reply = generate_snooze_resistance(match["label"], 1, total_rounds, history)
+    # Round 1 is the opening "snooze X" request — never a concession — so we only
+    # use the push-back text.
+    reply = generate_snooze_resistance(match["label"], 1, total_rounds, history)["reply"]
     history.append({"role": "assistant", "content": reply})
 
     payload = {
@@ -934,9 +936,24 @@ def continue_snooze_negotiation(db: Session, payload: dict, user_message: str) -
     total_rounds = payload.get("total_rounds", 1)
     rounds_remaining = payload.get("rounds_remaining", 0)
 
-    # Out of resistance — the bot relents and the snooze finally lands.
+    # One call both judges the reply and writes the response: if the push-back
+    # worked (the user caved and will do it now) it returns a victory cheer with
+    # conceded=True; otherwise an escalating push-back.
+    round_num = total_rounds - rounds_remaining + 1
+    result = generate_snooze_resistance(label, round_num, total_rounds, history)
+
+    # The push-back worked: the user is doing the item now. Drop the snooze
+    # entirely (the nag keeps its normal schedule) and cheer them on.
+    if result["conceded"]:
+        history.append({"role": "assistant", "content": result["reply"]})
+        return {"reply": result["reply"], "done": True, "payload": payload}
+
+    # Out of resistance and still not convinced — the bot relents and the
+    # snooze finally lands.
     if rounds_remaining <= 0:
-        concession = generate_snooze_resistance(label, total_rounds, total_rounds, history, relent=True)
+        concession = generate_snooze_resistance(
+            label, total_rounds, total_rounds, history, relent=True
+        )["reply"]
         confirm = execute_snooze(db, {
             "matched_id": payload["matched_id"],
             "matched_type": payload.get("matched_type", "nag"),
@@ -945,12 +962,10 @@ def continue_snooze_negotiation(db: Session, payload: dict, user_message: str) -
         return {"reply": f"{concession} {confirm}".strip(), "done": True, "payload": payload}
 
     # Still resisting — escalate.
-    round_num = total_rounds - rounds_remaining + 1
-    reply = generate_snooze_resistance(label, round_num, total_rounds, history)
-    history.append({"role": "assistant", "content": reply})
+    history.append({"role": "assistant", "content": result["reply"]})
     payload["history"] = history
     payload["rounds_remaining"] = rounds_remaining - 1
-    return {"reply": reply, "done": False, "payload": payload}
+    return {"reply": result["reply"], "done": False, "payload": payload}
 
 
 def execute_snooze(db: Session, payload: dict) -> str:

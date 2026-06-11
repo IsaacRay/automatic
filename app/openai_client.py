@@ -223,7 +223,7 @@ def generate_snooze_resistance(
     history: list[dict],
     *,
     relent: bool = False,
-) -> str:
+) -> dict:
     """Generate the AI's reply in a snooze negotiation.
 
     The user is trying to postpone the task `label`. The bot pushes back,
@@ -232,8 +232,13 @@ def generate_snooze_resistance(
     {"role": "user"|"assistant", "content": str} (the first user turn is the
     original snooze request; later user turns are the user's excuses).
 
-    When `relent=True`, generate the grudging concession instead of resistance.
-    Returns a short SMS line; falls back to a static line on any error.
+    Returns {"conceded": bool, "reply": str}. `conceded` is True only when the
+    user's latest reply shows the push-back WORKED — they've given up the snooze
+    and will do the task now — in which case `reply` is a cheerful victory line
+    and the caller should end the negotiation without snoozing. Otherwise `reply`
+    is the bot's push-back. When `relent=True`, the bot grudgingly gives in:
+    `reply` is the concession line and `conceded` is False. Falls back to static
+    lines on any error.
     """
     if relent:
         try:
@@ -248,28 +253,46 @@ def generate_snooze_resistance(
                 [{"role": "system", "content": system_prompt}, *history],
                 temperature=0.85,
             )
-            return content.strip()
+            return {"conceded": False, "reply": content.strip()}
         except Exception:
-            return "Ugh, fine. You win this time."
+            return {"conceded": False, "reply": "Ugh, fine. You win this time."}
 
     try:
         system_prompt = (
             "You are an ADHD accountability coach having an SMS argument. The user "
             f"wants to snooze/postpone this task: \"{label}\". Your job is to talk them "
-            "OUT of it and get them to just do it NOW. Push back on their latest excuse "
-            f"directly. This is resistance round {round_num} of {total_rounds}: scale your "
-            "incredulity to the round — round 1 is gently skeptical, and each later round "
-            "is more exasperated and openly incredulous that they're STILL trying to weasel "
-            "out of this. Keep it under 160 chars, punchy SMS tone, no emojis or hashtags. "
-            "Do NOT agree to the snooze and do NOT propose a compromise — hold the line."
+            "OUT of it and get them to just do it NOW.\n"
+            "First judge their LATEST reply: have they GIVEN IN — agreed to do the task "
+            "now (e.g. 'ok fine', 'you're right', 'ugh ok I'll do it', 'good point')? "
+            "Or are they still pushing to postpone it / making another excuse?\n"
+            "- If they gave in: set conceded=true and write ONE upbeat, genuinely "
+            "encouraging SMS line (under 120 chars) celebrating that they're tackling it "
+            "now and cheering them on.\n"
+            "- If they're still resisting: set conceded=false and push back on their "
+            f"latest excuse directly. This is resistance round {round_num} of "
+            f"{total_rounds}: scale your incredulity to the round — round 1 is gently "
+            "skeptical, and each later round is more exasperated and openly incredulous "
+            "that they're STILL trying to weasel out of this. Keep it under 160 chars. "
+            "Do NOT agree to the snooze and do NOT propose a compromise — hold the line.\n"
+            "Punchy SMS tone, no hashtags. "
+            'Respond with JSON: {"conceded": bool, "reply": str}.'
         )
         content = _chat(
             [{"role": "system", "content": system_prompt}, *history],
             temperature=0.85,
+            json_mode=True,
         )
-        return content.strip()
+        data = json.loads(content)
+        return {
+            "conceded": bool(data.get("conceded", False)),
+            "reply": str(data.get("reply", "")).strip()
+            or f"Come on — \"{label}\" can be done right now. Why put it off?",
+        }
     except Exception:
-        return f"Come on — \"{label}\" can be done right now. Why put it off?"
+        return {
+            "conceded": False,
+            "reply": f"Come on — \"{label}\" can be done right now. Why put it off?",
+        }
 
 
 def select_relevant_items(items: list[dict], context_text: str, local_now: datetime) -> list[int]:
