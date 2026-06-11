@@ -817,92 +817,140 @@ def _handle_cancel(db: Session, data: dict) -> str:
     return f"{reply}. Reply UNDO to reverse."
 
 
-def _handle_snooze(db: Session, data: dict) -> str:
-    import json as _json
+def _match_snooze_target(db: Session, raw_message: str) -> dict | None:
+    """Resolve which active nag a snooze request refers to.
+
+    With no usable keyword, picks the most imminent in-cycle nag. With a
+    keyword, runs the keyword prefilter then GPT fuzzy match. Returns a dict
+    {"id", "label", "snooze_count"} or None if nothing matches.
+    """
     import logging
-    import re
     from app.openai_client import deduce_acknowledge_target
 
     log = logging.getLogger(__name__)
 
-    duration = data.get("duration_minutes")
-    raw_message = data.get("_raw_message", "")
+    raw_keywords = [w.lower() for w in raw_message.split()
+                    if w.lower() not in _SNOOZE_STOP_WORDS and len(w) > 1]
 
-    # Fallback: parse duration from raw message if GPT missed it
-    if not duration:
-        duration = _parse_snooze_duration(raw_message)
-    duration = min(duration, 1440)  # cap at 24 hours
-
-    keyword = data.get("keyword")
-    now = datetime.now(timezone.utc)
-
-    # Extract keywords from raw message if parser missed them
-    raw_keywords = [w.lower() for w in raw_message.split() if w.lower() not in _SNOOZE_STOP_WORDS and len(w) > 1]
-    if not keyword and raw_keywords:
-        keyword = " ".join(raw_keywords)
-
-    # No keyword — pick most recent active nag
-    if not keyword:
+    # No keyword — pick the most imminent nag already in a cycle.
+    if not raw_keywords:
         nag = db.query(NagSchedule).filter(
             NagSchedule.user_phone == USER_PHONE,
             NagSchedule.status == "active",
             NagSchedule.active_since.isnot(None),
         ).order_by(NagSchedule.next_nag_at.asc()).first()
-
         if nag:
-            match = {"id": nag.id, "type": "nag", "label": nag.label}
-        else:
-            return "Nothing to snooze!"
-    else:
-        # Keyword provided — gather all snoozeable items and match
-        items = []
+            return {"id": nag.id, "label": nag.label, "snooze_count": nag.snooze_count or 0}
+        return None
 
-        for n in db.query(NagSchedule).filter(
-            NagSchedule.user_phone == USER_PHONE,
-            NagSchedule.status == "active",
-        ).all():
-            state = "ACTIVE" if n.active_since else "waiting"
-            items.append({"id": n.id, "type": "nag", "label": n.label,
-                           "detail": f"deadline {_format_time(n.deadline_at)} [{state}]" if n.deadline_at else f"[{state}]",
-                           "message": n.message})
+    # Keyword provided — gather all snoozeable items and match.
+    items = []
+    for n in db.query(NagSchedule).filter(
+        NagSchedule.user_phone == USER_PHONE,
+        NagSchedule.status == "active",
+    ).all():
+        state = "ACTIVE" if n.active_since else "waiting"
+        items.append({"id": n.id, "type": "nag", "label": n.label,
+                       "detail": f"deadline {_format_time(n.deadline_at)} [{state}]" if n.deadline_at else f"[{state}]",
+                       "message": n.message, "snooze_count": n.snooze_count or 0})
 
-        if not items:
-            return "Nothing to snooze!"
+    if not items:
+        return None
 
-        original_message = data.get("_raw_message") or keyword
-
-        match = _keyword_prefilter(original_message, items, _SNOOZE_STOP_WORDS)
+    match = _keyword_prefilter(raw_message, items, _SNOOZE_STOP_WORDS)
+    if not match:
+        result = deduce_acknowledge_target(raw_message, items)
+        log.info("Snooze match result: %s", result)
+        try:
+            matched_id = int(result.get("matched_id"))
+        except (ValueError, TypeError):
+            return None
+        match = next((i for i in items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
         if not match:
-            result = deduce_acknowledge_target(original_message, items)
-            log.info("Snooze match result: %s", result)
+            return None
 
-            if not result.get("matched_id"):
-                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+    return {"id": match["id"], "label": match["label"], "snooze_count": match.get("snooze_count", 0)}
 
-            try:
-                matched_id = int(result["matched_id"])
-            except (ValueError, TypeError):
-                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
 
-            match = next((i for i in items if i["id"] == matched_id and i["type"] == result.get("matched_type")), None)
-            if not match:
-                return f"Couldn't find anything matching \"{keyword}\". Text LIST to see your items."
+def _handle_snooze(db: Session, data: dict) -> str:
+    """Snooze intent ('later', 'not now', ...) — route into the negotiation."""
+    return start_snooze_negotiation(db, data.get("_raw_message", ""))
 
-    # Execute immediately and store undo state
-    payload = {"matched_id": match["id"], "matched_type": match["type"], "label": match["label"], "duration_minutes": duration}
-    undo_state = _capture_snooze_undo(db, match["id"], match["type"])
-    reply = execute_snooze(db, payload)
 
-    undo_payload = {**payload, "undo_state": undo_state}
+def start_snooze_negotiation(db: Session, raw_message: str) -> str:
+    """Begin a snooze negotiation. The bot resists the snooze for
+    (snooze_count + 1) rounds, escalating its incredulity, before relenting.
+    Sends the first push-back and stores the negotiation as a
+    PendingConfirmation; subsequent replies are handled by
+    `continue_snooze_negotiation`. If the item has never been snoozed it still
+    gets one round of push-back.
+    """
+    import json as _json
+    from app.openai_client import generate_snooze_resistance
+
+    match = _match_snooze_target(db, raw_message)
+    if not match:
+        return "Couldn't find anything to snooze. Text LIST to see your items."
+
+    duration = min(_parse_snooze_duration(raw_message), 1440)  # cap at 24 hours
+    total_rounds = (match.get("snooze_count") or 0) + 1
+
+    history = [{"role": "user", "content": raw_message or f"snooze {match['label']}"}]
+    reply = generate_snooze_resistance(match["label"], 1, total_rounds, history)
+    history.append({"role": "assistant", "content": reply})
+
+    payload = {
+        "matched_id": match["id"],
+        "matched_type": "nag",
+        "label": match["label"],
+        "duration_minutes": duration,
+        "total_rounds": total_rounds,
+        "rounds_remaining": total_rounds - 1,
+        "history": history,
+    }
+    # One negotiation at a time.
     db.query(PendingConfirmation).filter(PendingConfirmation.user_phone == USER_PHONE).delete()
     db.add(PendingConfirmation(
         user_phone=USER_PHONE,
-        action_type="undo_snooze",
-        payload=_json.dumps(undo_payload),
+        action_type="snooze_negotiation",
+        payload=_json.dumps(payload),
     ))
     db.commit()
+    return reply
 
-    return f"{reply} Reply UNDO to reverse."
+
+def continue_snooze_negotiation(db: Session, payload: dict, user_message: str) -> dict:
+    """Handle one user reply in an ongoing snooze negotiation.
+
+    Returns {"reply": str, "done": bool, "payload": dict}. When done is True the
+    snooze has been applied and the caller should clear the pending row;
+    otherwise the caller should persist the returned payload and keep waiting.
+    """
+    from app.openai_client import generate_snooze_resistance
+
+    history = payload.get("history", [])
+    history.append({"role": "user", "content": user_message})
+    label = payload.get("label", "that")
+    total_rounds = payload.get("total_rounds", 1)
+    rounds_remaining = payload.get("rounds_remaining", 0)
+
+    # Out of resistance — the bot relents and the snooze finally lands.
+    if rounds_remaining <= 0:
+        concession = generate_snooze_resistance(label, total_rounds, total_rounds, history, relent=True)
+        confirm = execute_snooze(db, {
+            "matched_id": payload["matched_id"],
+            "matched_type": payload.get("matched_type", "nag"),
+            "duration_minutes": payload.get("duration_minutes", 60),
+        })
+        return {"reply": f"{concession} {confirm}".strip(), "done": True, "payload": payload}
+
+    # Still resisting — escalate.
+    round_num = total_rounds - rounds_remaining + 1
+    reply = generate_snooze_resistance(label, round_num, total_rounds, history)
+    history.append({"role": "assistant", "content": reply})
+    payload["history"] = history
+    payload["rounds_remaining"] = rounds_remaining - 1
+    return {"reply": reply, "done": False, "payload": payload}
 
 
 def execute_snooze(db: Session, payload: dict) -> str:
@@ -1047,7 +1095,7 @@ def _handle_help(db: Session, data: dict) -> str:
         "- Mark done: \"<thing> done\" or just \"done\"\n"
         "- Clear all: \"done all\"\n"
         "- Cancel: \"cancel [keyword]\" or \"nevermind\"\n"
-        "- Snooze: \"snooze\" or \"snooze 30\" (minutes)\n"
+        "- Snooze: \"snooze [keyword] [30]\" — you'll have to talk me into it\n"
         "- Morning briefing: \"briefing\" or \"what's my day look like\"\n"
         "- See your list: \"list\"\n"
         "- This message: \"commands\" or \"#help\"\n"

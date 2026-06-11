@@ -13,7 +13,7 @@ from app.database import SessionLocal
 from app.models import SmsLog, PendingConfirmation, CheckList, CheckListItem, NagSchedule
 from app.config import USER_PHONE, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag, _handle_help, _apply_deadline_reply
+from app.intent_router import handle_intent, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag, _handle_help, _apply_deadline_reply, start_snooze_negotiation, continue_snooze_negotiation
 from app.twilio_client import send_sms
 
 PHOTOS_DIR = "/app/photos"
@@ -334,6 +334,28 @@ async def incoming_sms(request: Request):
             db.commit()
             return Response(content=EMPTY_TWIML, media_type="application/xml")
 
+        if pending and pending.action_type == "snooze_negotiation":
+            # User is arguing their case mid-snooze. The bot resists for a fixed
+            # number of rounds (snooze_count + 1) then relents.
+            payload = json.loads(pending.payload)
+            outcome = continue_snooze_negotiation(db, payload, Body.strip())
+            if outcome["done"]:
+                db.delete(pending)
+            else:
+                pending.payload = json.dumps(outcome["payload"])
+                pending.expires_at = now + timedelta(minutes=10)
+            db.commit()
+            reply = outcome["reply"]
+            result = send_sms(USER_PHONE, reply)
+            db.add(SmsLog(
+                direction="outbound",
+                phone=USER_PHONE,
+                body=reply,
+                twilio_sid=result.get("sid", ""),
+            ))
+            db.commit()
+            return Response(content=EMPTY_TWIML, media_type="application/xml")
+
         if pending:
             stripped = Body.strip().lower()
 
@@ -380,6 +402,21 @@ async def incoming_sms(request: Request):
             PendingConfirmation.expires_at <= now,
         ).delete()
         db.commit()
+
+        # A message that opens with "snooze" starts a snooze negotiation instead
+        # of going through GPT intent parsing: the bot pushes back and tries to
+        # talk you into doing the item now (escalating for snooze_count+1 rounds).
+        if stripped.lower().startswith("snooze"):
+            reply = start_snooze_negotiation(db, Body.strip())
+            result = send_sms(USER_PHONE, reply)
+            db.add(SmsLog(
+                direction="outbound",
+                phone=USER_PHONE,
+                body=reply,
+                twilio_sid=result.get("sid", ""),
+            ))
+            db.commit()
+            return Response(content=EMPTY_TWIML, media_type="application/xml")
 
         # Parse intent via OpenAI
         parsed = parse_user_sms(Body)

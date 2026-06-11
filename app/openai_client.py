@@ -216,6 +216,62 @@ def generate_nag_plan(labels: list[str]) -> str:
         return ""
 
 
+def generate_snooze_resistance(
+    label: str,
+    round_num: int,
+    total_rounds: int,
+    history: list[dict],
+    *,
+    relent: bool = False,
+) -> str:
+    """Generate the AI's reply in a snooze negotiation.
+
+    The user is trying to postpone the task `label`. The bot pushes back,
+    getting more incredulous each round, for `total_rounds` rounds before it
+    finally relents. `history` is the running conversation as a list of
+    {"role": "user"|"assistant", "content": str} (the first user turn is the
+    original snooze request; later user turns are the user's excuses).
+
+    When `relent=True`, generate the grudging concession instead of resistance.
+    Returns a short SMS line; falls back to a static line on any error.
+    """
+    if relent:
+        try:
+            system_prompt = (
+                "You are an ADHD accountability coach. You've spent several rounds "
+                f"resisting the user's attempt to put off the task: \"{label}\". "
+                "They've worn you down — now grudgingly give in. ONE short SMS line "
+                "(under 110 chars), mock-exasperated, conceding the snooze. No emojis "
+                "or hashtags. Do NOT state a duration; that's added separately."
+            )
+            content = _chat(
+                [{"role": "system", "content": system_prompt}, *history],
+                temperature=0.85,
+            )
+            return content.strip()
+        except Exception:
+            return "Ugh, fine. You win this time."
+
+    try:
+        system_prompt = (
+            "You are an ADHD accountability coach having an SMS argument. The user "
+            f"wants to snooze/postpone this task: \"{label}\". Your job is to talk them "
+            "OUT of it and get them to just do it NOW. Push back on their latest excuse "
+            f"directly. This is resistance round {round_num} of {total_rounds}: scale your "
+            "incredulity to the round — round 1 is gently skeptical, and each later round "
+            "is more exasperated and openly incredulous that they're STILL trying to weasel "
+            "out of this. Keep it under 160 chars, punchy SMS tone, no emojis or hashtags. "
+            "Do NOT agree to the snooze and do NOT propose a compromise — hold the line."
+        )
+        content = _chat(
+            [{"role": "system", "content": system_prompt}, *history],
+            temperature=0.85,
+        )
+        return content.strip()
+    except Exception:
+        return f"Come on — \"{label}\" can be done right now. Why put it off?"
+
+
 def select_relevant_items(items: list[dict], context_text: str, local_now: datetime) -> list[int]:
     """Pick which open to-do items are worth surfacing right now given the user's
     current context (location/intent), time of day, and each item's nature.
