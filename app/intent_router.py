@@ -390,6 +390,7 @@ def execute_acknowledge(db: Session, payload: dict) -> str:
             nag.deadline_at = None
             nag.nag_count = 0
             nag.snooze_count = 0
+            nag.burst_armed = False
             nag.completed_at = now
             nag.next_nag_at = _next_nag_cycle(nag, now)
             db.commit()
@@ -423,6 +424,7 @@ def execute_acknowledge_all(db: Session, payload: dict) -> str:
             nag.deadline_at = None
             nag.nag_count = 0
             nag.snooze_count = 0
+            nag.burst_armed = False
             nag.completed_at = now
             nag.next_nag_at = _next_nag_cycle(nag, now)
         else:
@@ -445,6 +447,7 @@ def reopen_nag(db: Session, nag_id: int) -> None:
     nag.status = "active"
     nag.completed_at = None
     nag.next_nag_at = now
+    nag.burst_armed = False
     db.commit()
 
 
@@ -995,6 +998,7 @@ def execute_snooze(db: Session, payload: dict) -> str:
             return "That nag no longer exists."
         nag.next_nag_at = snooze_until
         nag.snooze_count = (nag.snooze_count or 0) + 1
+        nag.burst_armed = False  # let the pushed-back deadline re-arm its burst
         if nag.deadline_at:
             nag.deadline_at = nag.deadline_at + timedelta(minutes=duration)
         db.commit()

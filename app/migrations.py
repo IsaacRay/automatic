@@ -53,6 +53,9 @@ def run_migrations():
             conn.execute(text(
                 "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS snooze_count INTEGER NOT NULL DEFAULT 0"
             ))
+            conn.execute(text(
+                "ALTER TABLE nag_schedules ADD COLUMN IF NOT EXISTS burst_armed BOOLEAN NOT NULL DEFAULT false"
+            ))
             conn.execute(text("ALTER TABLE nag_schedules DROP COLUMN IF EXISTS max_interval_minutes"))
             conn.execute(text("ALTER TABLE sms_log DROP COLUMN IF EXISTS related_type"))
             conn.execute(text("ALTER TABLE sms_log DROP COLUMN IF EXISTS related_id"))

@@ -52,6 +52,8 @@ GMAIL_SEARCH_DAYS = int(os.environ.get("GMAIL_SEARCH_DAYS", "30"))
 # Morning briefing
 WEATHERAPI_KEY = _env_or_file("WEATHERAPI_KEY", "/home/iray/weatherapi_key.txt")
 BRIEFING_TIME = os.environ.get("BRIEFING_TIME", "07:30")
+# Daily time to auto-import today's calendar events onto the today list.
+CALENDAR_IMPORT_TIME = os.environ.get("CALENDAR_IMPORT_TIME", "08:00")
 
 # Exercise motivation
 EXERCISE_MORNING_TIME = os.environ.get("EXERCISE_MORNING_TIME", "10:00")
@@ -69,6 +71,13 @@ DEFAULT_MAX_INTERVAL = int(os.environ.get("DEFAULT_MAX_INTERVAL", "1440"))
 # Global floor between any two outbound nag SMS (minutes). At most one nag SMS
 # per this window; items due in the same window coalesce into a single message.
 GLOBAL_NAG_MIN_GAP = int(os.environ.get("GLOBAL_NAG_MIN_GAP", "5"))
+# Random gap (minutes) between daytime list digests — the bot picks a fresh
+# random value in this range after each digest.
+DIGEST_MIN_GAP = int(os.environ.get("DIGEST_MIN_GAP", "45"))
+DIGEST_MAX_GAP = int(os.environ.get("DIGEST_MAX_GAP", "120"))
+# Once an item's expire time passes (after its due burst), it keeps pinging at
+# this fixed interval (minutes) until checked off or snoozed.
+OVERDUE_PING_GAP = int(os.environ.get("OVERDUE_PING_GAP", "5"))
 
 # Basement light webhooks (IFTTT)
 BASEMENT_LIGHT_ON = os.environ.get("BASEMENT_LIGHT_ON", "")

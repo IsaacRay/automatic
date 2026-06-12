@@ -65,6 +65,9 @@ class NagSchedule(Base):
     deadline_at = Column(DateTime(timezone=True), nullable=True)
     deadline_offset_minutes = Column(Integer, nullable=True)
     min_interval_minutes = Column(Integer, nullable=True)
+    # True once the T-3 due burst has been enqueued for the current deadline;
+    # reset on cycle start, acknowledge, and overnight rollover.
+    burst_armed = Column(Boolean, nullable=False, default=False)
 
 
 class ProcessedEmail(Base):

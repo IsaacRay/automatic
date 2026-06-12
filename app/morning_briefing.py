@@ -36,6 +36,51 @@ def fetch_weather() -> str:
     )
 
 
+def fetch_calendar_items() -> list[dict]:
+    """Fetch today's calendar events as structured rows for the today list.
+
+    Returns a list of {"summary", "uid", "all_day", "start"} where start is a
+    UTC datetime for timed events and None for all-day events. Raises on fetch
+    or parse failure so the caller can log and skip the import cleanly."""
+    if not GOOGLE_CALENDAR_ICS:
+        return []
+
+    import icalendar
+    import recurring_ical_events
+    from zoneinfo import ZoneInfo
+
+    try:
+        tz = ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        tz = timezone.utc
+
+    req = urllib.request.Request(GOOGLE_CALENDAR_ICS)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        cal = icalendar.Calendar.from_ical(resp.read())
+
+    today = datetime.now(tz).date()
+    start = datetime(today.year, today.month, today.day, tzinfo=tz)
+    end = start + timedelta(days=1)
+
+    items = []
+    for ev in recurring_ical_events.of(cal).between(start, end):
+        summary = str(ev.get("SUMMARY", "")).strip()
+        if not summary:
+            continue
+        uid = str(ev.get("UID", "")) or summary
+        dtstart = ev.get("DTSTART").dt
+        if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
+            items.append({"summary": summary, "uid": uid, "all_day": True, "start": None})
+        else:
+            items.append({
+                "summary": summary,
+                "uid": uid,
+                "all_day": False,
+                "start": dtstart.astimezone(timezone.utc),
+            })
+    return items
+
+
 def fetch_calendar_events() -> str:
     """Fetch today's Google Calendar events via public ICS feed."""
     if not GOOGLE_CALENDAR_ICS:
