@@ -34,7 +34,10 @@ if [ -z "$cid" ] || [ -z "$("$DOCKER" ps -q --no-trunc --filter "id=$cid" 2>/dev
 fi
 
 ts="$(date +%Y%m%d-%H%M%S)"
-out="$BACKUP_DIR/adhdbot-$ts.sql.gz"
+# Tag the dump with the deployed commit. `-c safe.directory=*` lets git read
+# the repo even when this runs as root (systemd) against an iray-owned tree.
+sha="$(git -c safe.directory='*' -C "$COMPOSE_DIR" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+out="$BACKUP_DIR/adhdbot-$ts-$sha.sql.gz"
 tmp="$out.partial"
 
 if "$DOCKER" exec "$cid" pg_dump -U "$DB_USER" "$DB_NAME" 2>/dev/null | gzip -c > "$tmp"; then
