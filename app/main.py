@@ -13,7 +13,7 @@ from app.database import SessionLocal
 from app.models import SmsLog, PendingConfirmation, CheckList, CheckListItem, NagSchedule
 from app.config import USER_PHONE, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 from app.openai_client import parse_user_sms
-from app.intent_router import handle_intent, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag, _handle_help, _apply_deadline_reply, start_snooze_negotiation, continue_snooze_negotiation
+from app.intent_router import handle_intent, undo_cancel, undo_acknowledge, undo_acknowledge_all, undo_snooze, _handle_create_nag, _handle_help, _apply_deadline_reply, start_snooze_negotiation, continue_snooze_negotiation, complete_yesterday
 from app.twilio_client import send_sms
 
 PHOTOS_DIR = "/app/photos"
@@ -156,6 +156,26 @@ async def incoming_sms(request: Request):
             db.commit()
         except Exception:
             log.exception("Error sending help")
+            db.rollback()
+        finally:
+            db.close()
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+    # Close out a prior-day item — "yesterday <item> complete" — stops leftover
+    # overdue pings without consuming today's cycle. Prefix-handled so it never
+    # gets misrouted to a normal acknowledge (which would silence today too).
+    if stripped.lower().startswith("yesterday "):
+        remainder = stripped[len("yesterday "):].strip()
+        db = SessionLocal()
+        try:
+            db.add(SmsLog(direction="inbound", phone=From, body=Body, twilio_sid=MessageSid))
+            db.commit()
+            reply = complete_yesterday(db, remainder)
+            result = send_sms(USER_PHONE, reply)
+            db.add(SmsLog(direction="outbound", phone=USER_PHONE, body=reply, twilio_sid=result.get("sid", "")))
+            db.commit()
+        except Exception:
+            log.exception("Error closing out yesterday's item")
             db.rollback()
         finally:
             db.close()

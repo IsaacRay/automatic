@@ -121,6 +121,35 @@ def _next_nag_cycle(nag, completion_time: datetime = None) -> datetime:
     return _next_cron_fire(nag.cron_expression, nag.timezone, after=after_today)
 
 
+def roll_recurring_to_next_cycle(nag, now: datetime) -> None:
+    """Reset a recurring nag off its current (stale/overdue) cycle onto its next
+    legitimate one, clearing burst/nag/snooze counters. If its cron fires later
+    today it goes dormant so a fresh cycle starts then; if its cron already fired
+    earlier today it's activated now with the expire time pinned to 11 PM today
+    and tomorrow's fire queued. Shared by the overnight rollover
+    (`scheduler._rollover_missed`) and the manual "yesterday ... done" close-out
+    so both behave identically. Does not commit."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(nag.timezone or USER_TIMEZONE)
+    nag.nag_count = 0
+    nag.snooze_count = 0
+    nag.burst_armed = False
+    cron_passed_today = False
+    if nag.next_nag_at <= now:
+        next_fire = _next_cron_fire(nag.cron_expression, nag.timezone)
+        cron_passed_today = next_fire.astimezone(tz).date() > now.astimezone(tz).date()
+    else:
+        next_fire = nag.next_nag_at
+    if cron_passed_today:
+        eod = now.astimezone(tz).replace(hour=23, minute=0, second=0, microsecond=0)
+        nag.active_since = now
+        nag.deadline_at = eod.astimezone(timezone.utc)
+        nag.next_nag_at = next_fire
+    else:
+        nag.active_since = None
+        nag.deadline_at = None
+        nag.next_nag_at = next_fire
+
 
 _ACK_STOP_WORDS = frozenset({
     "done", "finished", "completed", "got", "handled", "did", "do",
@@ -758,6 +787,84 @@ def _handle_acknowledge(db: Session, data: dict) -> str:
     return f"{reply} Reply UNDO to reverse."
 
 
+_YESTERDAY_STOP_WORDS = _ACK_STOP_WORDS | frozenset({
+    "yesterday", "complete", "completes", "yesterdays", "yday", "last", "night",
+})
+
+
+def complete_yesterday(db: Session, raw_message: str) -> str:
+    """Close out a prior-day item via the "yesterday <item> complete" keyword.
+
+    Stops yesterday's leftover overdue pings without consuming today's cycle:
+    a recurring item is rolled onto its next legitimate cycle (so today's daily
+    still nags) and stamped completed_at = end of yesterday for the record; a
+    one-shot is simply marked done. Acts immediately (no YES confirmation)."""
+    import logging
+    from zoneinfo import ZoneInfo
+    from app.openai_client import deduce_acknowledge_target
+
+    log = logging.getLogger(__name__)
+    now = datetime.now(timezone.utc)
+
+    keywords = [w.lower() for w in raw_message.split()
+                if w.lower() not in _YESTERDAY_STOP_WORDS and len(w) > 1]
+    if not keywords:
+        return ("Which item from yesterday? Text \"yesterday <item> complete\" "
+                "— e.g. \"yesterday take pills complete\".")
+
+    items = []
+    for n in db.query(NagSchedule).filter(
+        NagSchedule.user_phone == USER_PHONE,
+        NagSchedule.status == "active",
+    ).all():
+        state = "ACTIVE" if n.active_since else "waiting"
+        items.append({"id": n.id, "type": "nag", "label": n.label,
+                      "detail": f"deadline {_format_time(n.deadline_at)} [{state}]" if n.deadline_at else f"[{state}]",
+                      "message": n.message})
+    if not items:
+        return "Nothing on your list to close out."
+
+    match = _keyword_prefilter(raw_message, items, _YESTERDAY_STOP_WORDS)
+    if not match:
+        result = deduce_acknowledge_target(raw_message, items)
+        log.info("Yesterday close-out match result: %s", result)
+        try:
+            matched_id = int(result.get("matched_id"))
+        except (ValueError, TypeError):
+            matched_id = None
+        match = next((i for i in items if i["id"] == matched_id), None) if matched_id else None
+    if not match:
+        return (f"Couldn't find \"{' '.join(keywords)}\" on your list. "
+                "Text LIST to see your items.")
+
+    nag = db.query(NagSchedule).filter(
+        NagSchedule.id == match["id"], NagSchedule.status == "active"
+    ).first()
+    if not nag:
+        return "That item no longer exists."
+
+    tz = ZoneInfo(nag.timezone or USER_TIMEZONE)
+    end_of_yesterday = (now.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+                        - timedelta(minutes=1))
+
+    if nag.repeating:
+        # Record yesterday's completion (so is_done_today stays False today) and
+        # roll forward, so leftover pings stop but today's cycle survives.
+        nag.completed_at = end_of_yesterday.astimezone(timezone.utc)
+        roll_recurring_to_next_cycle(nag, now)
+        db.commit()
+        log.info("Closed out yesterday's recurring nag #%d: %s", nag.id, nag.label)
+        return (f'Closed out yesterday\'s "{nag.label}" — pings stopped. '
+                f"Today's still on the list.")
+    else:
+        nag.status = "deleted"
+        nag.completed_at = end_of_yesterday.astimezone(timezone.utc)
+        nag.burst_armed = False
+        db.commit()
+        log.info("Closed out yesterday's one-shot nag #%d: %s", nag.id, nag.label)
+        return f'Closed out yesterday\'s "{nag.label}". Done.'
+
+
 def _handle_cancel(db: Session, data: dict) -> str:
     import json as _json
     import logging
@@ -1119,6 +1226,7 @@ def _handle_help(db: Session, data: dict) -> str:
         "- Flash lights: \"flash lights at 9pm\"\n"
         "- Set your context: \"heading to Target\" / \"home for the night\"\n"
         "- Mark done: \"<thing> done\" or just \"done\"\n"
+        "- Close out yesterday: \"yesterday <thing> complete\" — stops leftover pings, keeps today's\n"
         "- Clear all: \"done all\"\n"
         "- Cancel: \"cancel [keyword]\" or \"nevermind\"\n"
         "- Snooze: \"snooze [keyword] [30]\" — you'll have to talk me into it\n"

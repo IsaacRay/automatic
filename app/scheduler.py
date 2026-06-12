@@ -17,7 +17,7 @@ from app.config import (
     CALENDAR_IMPORT_TIME,
 )
 from app.twilio_client import send_sms
-from app.intent_router import _next_cron_fire, _next_nag_cycle
+from app.intent_router import _next_cron_fire, _next_nag_cycle, roll_recurring_to_next_cycle
 from app.morning_briefing import generate_morning_briefing, fetch_calendar_items
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -407,27 +407,9 @@ def _rollover_missed(db, now):
         missed.append(nag.label)
         nag.burst_armed = False
         if nag.repeating:
-            nag.nag_count = 0
-            cron_passed_today = False
-            if nag.next_nag_at <= now:
-                next_fire = _next_cron_fire(nag.cron_expression, nag.timezone)
-                cron_passed_today = next_fire.astimezone(tz).date() > now.astimezone(tz).date()
-            else:
-                next_fire = nag.next_nag_at
-            if cron_passed_today:
-                # Cron already fired earlier today — carry the item onto today
-                # directly: activate now, pin the expire time to exactly 11 PM,
-                # and queue the next cron fire (tomorrow).
-                eod = now.astimezone(tz).replace(hour=23, minute=0, second=0, microsecond=0)
-                nag.active_since = now
-                nag.deadline_at = eod.astimezone(timezone.utc)
-                nag.next_nag_at = next_fire
-            else:
-                # Cron fires later today — reset to dormant so a fresh cycle
-                # starts at its normal cron time.
-                nag.active_since = None
-                nag.deadline_at = None
-                nag.next_nag_at = next_fire
+            # Roll onto the next legitimate cycle (dormant if its cron fires
+            # later today; carried-active pinned to 11 PM if it already fired).
+            roll_recurring_to_next_cycle(nag, now)
         else:
             # Carry the one-shot onto today, re-dated to 11 PM local.
             eod = now.astimezone(tz).replace(hour=23, minute=0, second=0, microsecond=0)

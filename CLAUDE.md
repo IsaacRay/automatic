@@ -103,6 +103,7 @@ The today list is a view over nags, not a new table — it's the unified surface
 - **Deadline follow-up**: if no deadline/cron is found, the new nag defaults to end-of-day (11pm) and a `PendingConfirmation(action_type="set_deadline")` is created. The next reply is parsed by `_apply_deadline_reply` (`intent_router.py`) — a time sets `deadline_at`, "none"/blank keeps the default.
 - **Daily items** = recurring nags on a daily cron — they reappear on the list every day; checking one off ends today's cycle (`_next_nag_cycle` → next day).
 - **Check-off**: text `<thing> done` → normal `acknowledge` flow (keyword prefilter → GPT fuzzy match → `execute_acknowledge`). Also a per-item check-off checkbox on the front-page UI (`/nag/done/{id}`).
+- **Close out yesterday**: text `yesterday <thing> complete` (prefix-handled in `/sms` → `complete_yesterday`). Stops a prior-day item's leftover overdue pings *without* consuming today's cycle: a recurring item is rolled onto its next legitimate cycle (`roll_recurring_to_next_cycle`, shared with the morning rollover) and stamped `completed_at` = end of yesterday (so `is_done_today` stays False and today's daily still nags); a one-shot is marked done. Distinct from a plain `<thing> done`, which stamps `completed_at=now` and would silence today too.
 - **UI**: `/` (the front page) is "Today's List" only (active nags due/scheduled today, via `context_engine.today_items`), each row a checkbox that checks the item off.
 
 ### Checklists (`app/models.py: CheckList, CheckListItem`)
@@ -120,7 +121,7 @@ Twilio POST → /sms
   ├─ From KATHRYN_PHONE (+19739787648)? → Auto-create nag, send confirmation
   ├─ From != USER_PHONE? → Reject
   └─ From == USER_PHONE:
-       ├─ Prefix shortcuts (bypass GPT): "#help", "#newlist", "#updatelist", ".. " (capture nag) → handle directly, return
+       ├─ Prefix shortcuts (bypass GPT): "#help", "#newlist", "#updatelist", ".. " (capture nag), "yesterday " (close out a prior-day item) → handle directly, return
        ├─ PendingConfirmation(set_deadline)? → parse reply → set deadline on the just-created nag, return
        ├─ PendingConfirmation exists? → Handle YES/NO → execute or decline
        └─ No pending confirmation:
