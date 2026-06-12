@@ -299,14 +299,23 @@ def fire_digests(db):
 
 
 def _overdue_items(db, now):
-    """Active, not-yet-done items whose expire time has already passed."""
+    """Active, not-yet-done items whose expire time passed *earlier today*.
+
+    Items whose deadline was on a prior day are NOT overdue here — they're
+    "missed" and belong to the morning rollover + MISSED burst (or a manual
+    "yesterday <item> complete"). Without this lower bound, a prior-day item
+    that rollover hasn't reset yet (the 6-7:30 AM pre-briefing window, or a
+    briefing whose fetch failed) would ping every OVERDUE_PING_GAP minutes."""
+    from zoneinfo import ZoneInfo
     from app.context_engine import today_items, is_done_today
+    tz = ZoneInfo(USER_TIMEZONE)
+    start_today = now.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
     out = []
     for nag in today_items(db, now):
         if nag.active_since is None or is_done_today(nag, now):
             continue
         dl = _effective_deadline(nag, now)
-        if dl is not None and dl <= now:
+        if dl is not None and start_today <= dl <= now:
             out.append(nag)
     return out
 

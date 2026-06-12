@@ -59,7 +59,7 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
 - `burst_armed` is reset on cycle start, acknowledge, reopen, snooze, and overnight rollover so the next deadline re-arms
 
 **Overdue pings** (`scheduler.py: fire_overdue_pings`):
-- After the due burst, any active item still open past its expire time keeps pinging **every `OVERDUE_PING_GAP` minutes** (default 5) until it's **checked off** (`completed_at` set) or **snoozed** (snooze pushes `deadline_at` forward, dropping it out of overdue)
+- After the due burst, any active item still open past its expire time **but whose deadline is still today** keeps pinging **every `OVERDUE_PING_GAP` minutes** (default 5) until it's **checked off** (`completed_at` set) or **snoozed** (snooze pushes `deadline_at` forward, dropping it out of overdue). Items whose deadline was a **prior day** are excluded (`_overdue_items` requires `start_of_today ≤ deadline ≤ now`) — those are "missed" and belong to the morning rollover or a manual `yesterday <item> complete`, so a not-yet-rolled-over item never pings in the pre-briefing window
 - All past-due items are **coalesced into one ping** ("OVERDUE: ..."); the next fire time is stored in `app_state` under `next_overdue_ping_at`. When nothing is overdue the key is cleared, so the next overdue item waits a fresh full gap before its first ping
 - **Holds during quiet hours** without advancing (resumes at `QUIET_HOURS_END`); the morning rollover then carries anything still-open from the prior day
 
