@@ -13,7 +13,7 @@ from app.config import (
     USER_PHONE, USER_TIMEZONE, TICK_SECONDS, GMAIL_SYNC_INTERVAL,
     BASEMENT_LIGHT_ON, BASEMENT_LIGHT_OFF, BRIEFING_TIME,
     QUIET_HOURS_START, QUIET_HOURS_END,
-    DIGEST_MIN_GAP, DIGEST_MAX_GAP, OVERDUE_PING_GAP,
+    DEFAULT_MIN_INTERVAL, GLOBAL_NAG_MIN_GAP, OVERDUE_PING_GAP,
     CALENDAR_IMPORT_TIME,
 )
 from app.twilio_client import send_sms
@@ -97,62 +97,10 @@ def _is_quiet_hours(tz_name):
         return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
 
 
-def _format_clock(dt) -> str:
-    """Local clock time like '5:00 PM' for a UTC datetime."""
-    from zoneinfo import ZoneInfo
-    return dt.astimezone(ZoneInfo(USER_TIMEZONE)).strftime("%-I:%M %p")
-
-
-def _effective_deadline(nag, now):
-    """The item's expire time: explicit deadline_at, else this cycle's computed
-    deadline for a repeating item. None if not computable."""
-    from app.context_engine import cycle_deadline
-    return cycle_deadline(nag, now)
-
-
-def _enqueue_burst(db, messages):
-    """Append messages to the pending-burst queue, drained one per minute
-    (gate-exempt) by drain_burst."""
-    import json
-    raw = _get_state(db, "pending_burst")
-    queue = json.loads(raw) if raw else []
-    queue.extend(messages)
-    _set_state(db, "pending_burst", json.dumps(queue))
-
-
-def drain_burst(db):
-    """Send at most one queued burst message per ~minute. Bursts bypass the
-    digest cadence, but still hold during quiet hours."""
-    import json
-    now = datetime.now(timezone.utc)
-    raw = _get_state(db, "pending_burst")
-    queue = json.loads(raw) if raw else []
-    if not queue or _is_quiet_hours(USER_TIMEZONE):
-        return
-    last = _get_state(db, "burst_last_sent")
-    if last:
-        try:
-            if (now - datetime.fromisoformat(last)).total_seconds() < 50:
-                return
-        except ValueError:
-            pass
-    msg = queue.pop(0)
-    try:
-        result = send_sms(USER_PHONE, msg)
-        _set_state(db, "pending_burst", json.dumps(queue))
-        _set_state(db, "burst_last_sent", now.isoformat())
-        _log_outbound(db, msg, result.get("sid", ""))
-        db.commit()
-        log.info("Drained burst message (%d left)", len(queue))
-    except Exception:
-        log.exception("Failed to send burst message")
-        db.rollback()
-
-
 def fire_cycle_starts(db):
     """Activate dormant nags whose scheduled start has arrived: set active_since
-    and this cycle's deadline, then point next_nag_at at the next cycle so the
-    item doesn't re-trigger. Sends nothing — the digest surfaces active items."""
+    and this cycle's deadline, then point next_nag_at at *now* so the first Zeno
+    nag fires this same tick (via fire_due_nags). Sends nothing itself."""
     now = datetime.now(timezone.utc)
     nags = db.query(NagSchedule).filter(
         NagSchedule.status == "active",
@@ -179,11 +127,10 @@ def fire_cycle_starts(db):
             if nag.repeating and nag.deadline_offset_minutes is not None:
                 # Recurring nag: deadline is computed fresh each cycle.
                 nag.deadline_at = now + timedelta(minutes=nag.deadline_offset_minutes)
-            # Advance to the next cycle so this dormant trigger doesn't refire today.
-            if nag.repeating and nag.cron_expression:
-                nag.next_nag_at = _next_cron_fire(nag.cron_expression, nag.timezone)
-            else:
-                nag.next_nag_at = now + timedelta(days=3650)
+            # Start the Zeno cadence now: fire_due_nags will pick this up and
+            # advance next_nag_at by the Zeno interval after each send. The next
+            # cron cycle is recomputed fresh on check-off / overnight rollover.
+            nag.next_nag_at = now
             db.commit()
             log.info("Nag #%d cycle started: %s", nag.id, nag.label)
         except Exception:
@@ -191,65 +138,57 @@ def fire_cycle_starts(db):
             db.rollback()
 
 
-def fire_due_bursts(db):
-    """Arm the T-3/T-2/T-1 due burst: when an open item's expire time is within
-    the next 3 minutes, enqueue three once-a-minute alerts (coalescing items that
-    arm in the same tick). Each item arms once per deadline."""
-    from app.context_engine import today_items, is_done_today
-    now = datetime.now(timezone.utc)
-    if _is_quiet_hours(USER_TIMEZONE):
-        return
+def _compute_deadline_interval(nag, now):
+    """Zeno's-paradox cadence toward the expire time.
 
-    arming = []
-    for nag in today_items(db, now):
-        if nag.burst_armed or is_done_today(nag, now):
-            continue
-        dl = _effective_deadline(nag, now)
-        if dl is None:
-            continue
-        secs = (dl - now).total_seconds()
-        if 0 < secs <= 180:
-            arming.append((nag, dl))
-
-    if not arming:
-        return
-
-    try:
-        for nag, _dl in arming:
-            nag.burst_armed = True
-        labels = ", ".join(f'"{n.label}" (by {_format_clock(dl)})' for n, dl in arming)
-        msgs = [
-            f"DUE SOON ({i}/3): {labels}. Finish up now — reply DONE <item> when done."
-            for i in range(1, 4)
-        ]
-        _enqueue_burst(db, msgs)
-        db.commit()
-        log.info("Armed due burst for %d item(s): %s",
-                 len(arming), ", ".join(n.label for n, _dl in arming))
-    except Exception:
-        log.exception("Failed to arm due burst")
-        db.rollback()
+    Each step waits a random fraction (0.25–0.5) of the time remaining until
+    deadline_at, so nags accelerate as the deadline nears (with jitter rather
+    than a fixed curve), clamped to the item's min_interval_minutes or the global
+    DEFAULT_MIN_INTERVAL floor. Once the deadline has passed, acceleration stops
+    and the item simply pings every OVERDUE_PING_GAP minutes until done/snoozed.
+    No deadline → flat min interval."""
+    min_iv = nag.min_interval_minutes or DEFAULT_MIN_INTERVAL
+    if nag.deadline_at and now >= nag.deadline_at:
+        return OVERDUE_PING_GAP
+    if not nag.deadline_at:
+        return min_iv
+    remaining_minutes = (nag.deadline_at - now).total_seconds() / 60.0
+    fraction = random.uniform(0.25, 0.5)
+    interval = remaining_minutes * fraction
+    return max(min_iv, int(round(interval)))
 
 
-def _schedule_next_digest(db, now):
-    """Set next_digest_at to a fresh random gap from now."""
-    gap = random.randint(DIGEST_MIN_GAP, DIGEST_MAX_GAP)
-    _set_state(db, "next_digest_at", (now + timedelta(minutes=gap)).isoformat())
+def _single_nag_message(nag, now) -> str:
+    """Build the urgency-tailored message for a single due nag."""
+    nag_num = nag.nag_count + 1
+    if nag.deadline_at:
+        try:
+            from app.openai_client import generate_deadline_nag_message
+            msg = generate_deadline_nag_message(nag, now)
+        except Exception:
+            log.exception("GPT deadline message failed for nag #%d, using fallback", nag.id)
+            msg = f"(#{nag_num}) {nag.label} — deadline approaching!\nReply DONE when finished."
+    else:
+        msg = nag.message
+        if nag_num > 1:
+            msg = f"(#{nag_num}) {msg}"
+    if not msg.rstrip().endswith("Reply DONE when finished."):
+        msg += "\nReply DONE when finished."
+    return msg
 
 
-def _build_digest_message(items, now) -> str:
-    """One digest SMS: numbered open items + expire times, with a GPT plan line."""
-    pairs = [(n.label, _effective_deadline(n, now)) for n in items]
-    lines = ["Your list:"]
-    for i, (label, dl) in enumerate(pairs, 1):
-        when = f" — by {_format_clock(dl)}" if dl else ""
-        lines.append(f"{i}) {label}{when}")
+def _combined_nag_message(nags, now) -> str:
+    """Coalesce several simultaneously-due nags into one SMS: a numbered list
+    plus a short GPT-written plan line at the bottom (omitted on GPT failure)."""
+    lines = ["Due now:"]
+    for i, nag in enumerate(nags, 1):
+        lines.append(f"{i}) {nag.label}")
     body = "\n".join(lines)
     try:
         from app.openai_client import generate_nag_plan
-        plan = generate_nag_plan([label for label, _dl in pairs])
+        plan = generate_nag_plan([n.label for n in nags])
     except Exception:
-        log.exception("GPT digest plan failed, omitting plan line")
+        log.exception("GPT nag plan failed, omitting plan line")
         plan = ""
     if plan:
         body += f"\n\n{plan}"
@@ -257,127 +196,77 @@ def _build_digest_message(items, now) -> str:
     return body
 
 
-def fire_digests(db):
-    """Random-cadence digest: every DIGEST_MIN_GAP..DIGEST_MAX_GAP minutes, send
-    one SMS listing every open today item and its expire time."""
-    from app.context_engine import today_items, is_done_today
+def fire_due_nags(db):
+    """Zeno cadence — the single send loop for active items.
+
+    For every active item whose next_nag_at has arrived: prepare it (skip if
+    checked off, defer if quiet hours), then — subject to the global rate gate —
+    send one (possibly coalesced) nag SMS and advance each item's next_nag_at by
+    its Zeno interval (accelerating toward the expire time, or a flat
+    OVERDUE_PING_GAP once overdue)."""
+    from app.context_engine import is_done_today
     now = datetime.now(timezone.utc)
+    nags = db.query(NagSchedule).filter(
+        NagSchedule.status == "active",
+        NagSchedule.active_since.isnot(None),
+        NagSchedule.next_nag_at <= now,
+    ).with_for_update(skip_locked=True).all()
 
-    nd = _get_state(db, "next_digest_at")
-    if nd is None:
-        _schedule_next_digest(db, now)
-        db.commit()
+    ready = []
+    for nag in nags:
+        try:
+            # Checked off earlier today but lingering for display — stop nagging.
+            if is_done_today(nag, now):
+                continue
+
+            # Quiet hours: defer this item's next nag to when quiet hours end.
+            if _is_quiet_hours(nag.timezone):
+                from zoneinfo import ZoneInfo
+                local_now = datetime.now(ZoneInfo(nag.timezone))
+                resume_at = local_now.replace(hour=QUIET_HOURS_END, minute=0, second=0, microsecond=0)
+                if resume_at <= local_now:
+                    resume_at += timedelta(days=1)
+                nag.next_nag_at = resume_at.astimezone(timezone.utc)
+                db.commit()
+                log.info("Nag #%d deferred to %s (quiet hours): %s", nag.id, resume_at, nag.label)
+                continue
+
+            ready.append(nag)
+        except Exception:
+            log.exception("Failed to prepare nag #%d", nag.id)
+            db.rollback()
+
+    if not ready:
         return
+
+    # Global rate gate: at most one nag SMS per GLOBAL_NAG_MIN_GAP window.
+    last = _get_state(db, "last_nag_sent_at")
+    if last:
+        try:
+            if now - datetime.fromisoformat(last) < timedelta(minutes=GLOBAL_NAG_MIN_GAP):
+                log.info("Nag send gated: %d due, <%dm since last send", len(ready), GLOBAL_NAG_MIN_GAP)
+                return
+        except ValueError:
+            pass
+
+    # Send one (possibly coalesced) message for everything due this window.
     try:
-        if now < datetime.fromisoformat(nd):
-            return
-    except ValueError:
-        _schedule_next_digest(db, now)
-        db.commit()
-        return
+        if len(ready) == 1:
+            msg = _single_nag_message(ready[0], now)
+        else:
+            msg = _combined_nag_message(ready, now)
 
-    # Hold (without rescheduling) during quiet hours so the first digest lands
-    # right when quiet hours end.
-    if _is_quiet_hours(USER_TIMEZONE):
-        return
-
-    items = [n for n in today_items(db, now) if not is_done_today(n, now)]
-    _schedule_next_digest(db, now)
-    if not items:
-        db.commit()
-        return
-
-    try:
-        msg = _build_digest_message(items, now)
         result = send_sms(USER_PHONE, msg)
+        for nag in ready:
+            nag.nag_count += 1
+            interval = _compute_deadline_interval(nag, now)
+            nag.next_nag_at = now + timedelta(minutes=interval)
+        _set_state(db, "last_nag_sent_at", now.isoformat())
         _log_outbound(db, msg, result.get("sid", ""))
         db.commit()
-        log.info("Sent digest with %d item(s)", len(items))
+        log.info("Fired %d nag(s): %s", len(ready), ", ".join(n.label for n in ready))
     except Exception:
-        log.exception("Failed to send digest")
-        db.rollback()
-
-
-def _overdue_items(db, now):
-    """Active, not-yet-done items whose expire time passed *earlier today*.
-
-    Items whose deadline was on a prior day are NOT overdue here — they're
-    "missed" and belong to the morning rollover + MISSED burst (or a manual
-    "yesterday <item> complete"). Without this lower bound, a prior-day item
-    that rollover hasn't reset yet (the 6-7:30 AM pre-briefing window, or a
-    briefing whose fetch failed) would ping every OVERDUE_PING_GAP minutes."""
-    from zoneinfo import ZoneInfo
-    from app.context_engine import today_items, is_done_today
-    tz = ZoneInfo(USER_TIMEZONE)
-    start_today = now.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
-    out = []
-    for nag in today_items(db, now):
-        if nag.active_since is None or is_done_today(nag, now):
-            continue
-        dl = _effective_deadline(nag, now)
-        if dl is not None and start_today <= dl <= now:
-            out.append(nag)
-    return out
-
-
-def _build_overdue_message(items, now) -> str:
-    """One overdue ping listing every past-due open item and when it was due."""
-    parts = ", ".join(
-        f'"{n.label}" (was due {_format_clock(_effective_deadline(n, now))})'
-        for n in items
-    )
-    return (f"OVERDUE: {parts}. Reply DONE <item> when finished, "
-            f"or snooze to push it back.")
-
-
-def fire_overdue_pings(db):
-    """After an item's due burst, if it's still open keep pinging every
-    OVERDUE_PING_GAP minutes until it's checked off or snoozed. Coalesces all
-    past-due items into one ping. Holds (without rescheduling) during quiet
-    hours, like the digest."""
-    now = datetime.now(timezone.utc)
-    items = _overdue_items(db, now)
-
-    # Nothing overdue — clear the timer so the next overdue item starts a fresh
-    # OVERDUE_PING_GAP countdown rather than firing immediately.
-    if not items:
-        if _get_state(db, "next_overdue_ping_at") is not None:
-            db.query(AppState).filter(AppState.key == "next_overdue_ping_at").delete()
-            db.commit()
-        return
-
-    nop = _get_state(db, "next_overdue_ping_at")
-    if nop is None:
-        # First time we notice overdue items: wait one gap before the first ping
-        # (gives the T-1 burst message room to land).
-        _set_state(db, "next_overdue_ping_at",
-                   (now + timedelta(minutes=OVERDUE_PING_GAP)).isoformat())
-        db.commit()
-        return
-    try:
-        if now < datetime.fromisoformat(nop):
-            return
-    except ValueError:
-        _set_state(db, "next_overdue_ping_at",
-                   (now + timedelta(minutes=OVERDUE_PING_GAP)).isoformat())
-        db.commit()
-        return
-
-    # Hold during quiet hours without advancing, so pinging resumes at 6 AM.
-    if _is_quiet_hours(USER_TIMEZONE):
-        return
-
-    try:
-        msg = _build_overdue_message(items, now)
-        result = send_sms(USER_PHONE, msg)
-        _log_outbound(db, msg, result.get("sid", ""))
-        _set_state(db, "next_overdue_ping_at",
-                   (now + timedelta(minutes=OVERDUE_PING_GAP)).isoformat())
-        db.commit()
-        log.info("Sent overdue ping for %d item(s): %s",
-                 len(items), ", ".join(n.label for n in items))
-    except Exception:
-        log.exception("Failed to send overdue ping")
+        log.exception("Failed to send coalesced nag batch")
         db.rollback()
 
 
@@ -428,8 +317,8 @@ def _rollover_missed(db, now):
 
 def fire_morning_briefing(db):
     """Send the morning briefing once/day past BRIEFING_TIME, plus the overnight
-    rollover: surface items missed the previous day as a once-a-minute burst and
-    reset their cycles."""
+    rollover: surface items missed the previous day in a single recap SMS and
+    reset their cycles so today's Zeno cadence picks them up."""
     try:
         from zoneinfo import ZoneInfo
         now_local = datetime.now(ZoneInfo(USER_TIMEZONE))
@@ -460,11 +349,10 @@ def fire_morning_briefing(db):
         _log_outbound(db, msg, result.get("sid", ""))
         if missed:
             joined = ", ".join(f'"{m}"' for m in missed)
-            _enqueue_burst(db, [
-                f"MISSED ({i}/3): you didn't finish {joined} yesterday. "
-                f"Carried to today — reply DONE <item> when handled."
-                for i in range(1, 4)
-            ])
+            recap = (f"MISSED yesterday: {joined}. Carried to today — "
+                     f"reply DONE <item> when handled.")
+            recap_result = send_sms(USER_PHONE, recap)
+            _log_outbound(db, recap, recap_result.get("sid", ""))
             log.info("Rolled over %d missed item(s): %s", len(missed), ", ".join(missed))
         _set_state(db, "briefing_last_sent_date", today_str)
         db.commit()
@@ -590,10 +478,7 @@ def main():
             # Context-aware surfacing runs only when the user sends a context SMS
             # (handled in _handle_context_update), not on a timer.
             fire_cycle_starts(db)   # activate dormant nags at their start time
-            fire_due_bursts(db)     # arm T-3 due bursts into the queue
-            fire_overdue_pings(db)  # every 5 min past expire until done/snoozed
-            fire_digests(db)        # random-cadence list digest
-            drain_burst(db)         # send <=1 queued burst message/minute
+            fire_due_nags(db)       # Zeno cadence: send accelerating per-item nags
         except Exception:
             log.exception("Scheduler tick error")
         finally:

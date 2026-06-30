@@ -1,6 +1,6 @@
 # ADHD SMS Bot
 
-SMS-based personal assistant for ADHD management. Everything is a **nag** on a single **today list**: you capture items (with `.. `), each gets an **expire time**, and you're reminded via random whole-list **digests** through the day plus a 3-message **burst** in the minutes before each item expires. Also handles Gmail action-item extraction, scheduled basement-light flashes, and morning briefings. Built with FastAPI, PostgreSQL, Twilio, OpenAI GPT-4o, and Gmail IMAP.
+SMS-based personal assistant for ADHD management. Everything is a **nag** on a single **today list**: you capture items (with `.. `), each gets an **expire time**, and you're reminded on a **Zeno's-paradox cadence** — per-item nags that accelerate as each item's expire time approaches — then, once an item is overdue, a steady ping every 30 minutes until it's done. Also handles Gmail action-item extraction, scheduled basement-light flashes, and morning briefings. Built with FastAPI, PostgreSQL, Twilio, OpenAI GPT-4o, and Gmail IMAP.
 
 > Reminders and exercise tracking were removed — the system is nags-only. The `Reminder`/`ExerciseLog` models and their intents no longer exist; their tables linger as legacy.
 
@@ -20,7 +20,7 @@ Four Docker services (`docker-compose.yaml`):
 | `scheduled_flashes` | One-time basement-light flashes ("flash lights at 9pm") |
 | `pending_confirmations` | Stores confirmation/follow-up requests, incl. `set_deadline` and undo (10-min TTL) |
 | `processed_emails` | Tracks Gmail Message-IDs to prevent re-processing |
-| `app_state` | Key-value scheduler state (e.g., "briefing_last_sent_date", "calendar_last_imported_date" for the daily calendar import, "next_digest_at" for the next list digest, "next_overdue_ping_at" for the every-5-min overdue ping, "pending_burst"/"burst_last_sent" for the burst queue, "user_context" for the latest location/intent) |
+| `app_state` | Key-value scheduler state (e.g., "briefing_last_sent_date", "calendar_last_imported_date" for the daily calendar import, "last_nag_sent_at" for the global nag-rate gate, "user_context" for the latest location/intent. Legacy keys from the retired digest model — "next_digest_at", "next_overdue_ping_at", "pending_burst", "burst_last_sent" — may linger but are unused) |
 | `sms_log` | Full audit log of all inbound/outbound SMS |
 | `checklists` | Named, one-off checklists (created via `#newlist`) |
 | `checklist_items` | Items belonging to a `checklists` row (ordered by `position`) |
@@ -36,7 +36,7 @@ time, marks it `done`, and sends a short confirmation SMS. This is the only surv
 of the old reminder/event-pair light-flash behavior.
 
 ### Nags (`app/models.py: NagSchedule`)
-Nags are the unified model for both user-created nags and Gmail-extracted action items. Each item has an **expire time** (`deadline_at`) and surfaces in two ways: random whole-list **digests** through the day, and a 3-message **due burst** in the minutes before it expires. (The old per-item Zeno escalation is retired.)
+Nags are the unified model for both user-created nags and Gmail-extracted action items. Each item has an **expire time** (`deadline_at`) and nags itself on a **Zeno's-paradox cadence**: each successive nag waits a random 25–50% of the time remaining until the expire time, so reminders accelerate (with jitter) as the deadline nears, then flatten to a fixed every-30-minutes ping once overdue.
 
 **Timing concepts:**
 - **Expire time** (`deadline_at`): when the item is "due." For one-shots, defaults to 11 PM; for recurring, computed each cycle as the cron start + `deadline_offset_minutes`.
@@ -44,45 +44,38 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
 
 **Nag lifecycle (state machine across `scheduler.py` fire functions):**
 1. **Dormant** (`active_since=NULL`): waiting for `next_nag_at` to arrive
-2. **Cycle start** (`fire_cycle_starts`): when `next_nag_at` passes, sets `active_since=now`, `nag_count=0`, `snooze_count=0`, `burst_armed=False`; for recurring sets `deadline_at=now+deadline_offset_minutes` and advances `next_nag_at` to the next cron fire; one-shots park `next_nag_at` far in the future
-3. **Active**: item appears in digests and arms a due burst as its expire time approaches
+2. **Cycle start** (`fire_cycle_starts`): when `next_nag_at` passes, sets `active_since=now`, `nag_count=0`, `snooze_count=0`; for recurring sets `deadline_at=now+deadline_offset_minutes`; then points `next_nag_at=now` so the first Zeno nag fires the same tick. (While active, `next_nag_at` is the per-item Zeno send clock; the next cron cycle is recomputed fresh on check-off / overnight rollover.)
+3. **Active**: `fire_due_nags` sends Zeno-spaced nags until the item is checked off or rolled over
 4. **Check-off / completion**: ends the item for today (recurring → next cycle; one-shot → `status="deleted"`)
 
-**Random list digests** (`scheduler.py: fire_digests`, `_build_digest_message`):
-- At a random gap of `DIGEST_MIN_GAP`–`DIGEST_MAX_GAP` minutes (default 45–120), the bot sends one digest of **all open today-list items** with each item's expire time (`"<item> — by <clock>"`), plus a short GPT-generated "plan" line (`openai_client.py: generate_nag_plan`, plain fallback)
-- Next fire time is stored in `app_state` under `next_digest_at`; after each send a fresh random gap is scheduled (`_schedule_next_digest`)
-- During quiet hours the digest is **held without rescheduling** (fires once quiet hours end)
-
-**Due bursts** (`scheduler.py: fire_due_bursts`):
-- When an active item is within **3 minutes** of its expire time and not yet armed (`burst_armed=False`), it's armed (`burst_armed=True`) and a **3-message burst** (T−3 / T−2 / T−1, one per minute) is enqueued
-- Bursts go onto a shared **pending-burst queue** in `app_state` (`pending_burst`, a JSON list), drained by `drain_burst` at ≤1 message/minute (`burst_last_sent` tracks spacing). The queue **holds during quiet hours**
-- `burst_armed` is reset on cycle start, acknowledge, reopen, snooze, and overnight rollover so the next deadline re-arms
-
-**Overdue pings** (`scheduler.py: fire_overdue_pings`):
-- After the due burst, any active item still open past its expire time **but whose deadline is still today** keeps pinging **every `OVERDUE_PING_GAP` minutes** (default 5) until it's **checked off** (`completed_at` set) or **snoozed** (snooze pushes `deadline_at` forward, dropping it out of overdue). Items whose deadline was a **prior day** are excluded (`_overdue_items` requires `start_of_today ≤ deadline ≤ now`) — those are "missed" and belong to the morning rollover or a manual `yesterday <item> complete`, so a not-yet-rolled-over item never pings in the pre-briefing window
-- All past-due items are **coalesced into one ping** ("OVERDUE: ..."); the next fire time is stored in `app_state` under `next_overdue_ping_at`. When nothing is overdue the key is cleared, so the next overdue item waits a fresh full gap before its first ping
+**Zeno cadence** (`scheduler.py: fire_due_nags`, `_compute_deadline_interval`):
+- Every tick, `fire_due_nags` selects active items whose `next_nag_at` has arrived, sends one nag per item (a rich GPT-written deadline message via `openai_client.generate_deadline_nag_message`, plain fallback), and advances each `next_nag_at` by its Zeno interval
+- **Interval** (`_compute_deadline_interval`): before the expire time, a random 25–50% of the remaining minutes (accelerating, jittered), clamped to the item's `min_interval_minutes` or the global `DEFAULT_MIN_INTERVAL` floor (5 min). At/after the expire time it returns a flat `OVERDUE_PING_GAP` (default **30 min**) — the steady overdue ping. No deadline → flat min interval
+- **Coalescing + global gate**: items due in the same tick are merged into one numbered SMS (`_combined_nag_message`, with a GPT `generate_nag_plan` line); a single item gets `_single_nag_message`. At most one nag SMS per `GLOBAL_NAG_MIN_GAP` minutes (default 5) across all items, tracked in `app_state` under `last_nag_sent_at`
+- **Quiet hours**: a due item's `next_nag_at` is deferred to `QUIET_HOURS_END` rather than firing
+- An overdue item keeps pinging every 30 min until **checked off** (`completed_at` set) or **snoozed** (snooze pushes `deadline_at` and `next_nag_at` forward). Items still open at the day boundary are handled by the morning rollover, not by overnight pinging (quiet hours covers the gap)
 - **Holds during quiet hours** without advancing (resumes at `QUIET_HOURS_END`); the morning rollover then carries anything still-open from the prior day
 
-**Overnight rollover + missed burst** (`scheduler.py: _rollover_missed`, inside `fire_morning_briefing`):
-- At the morning briefing, items whose expire time was before the start of today and which weren't completed are **carried forward**; `burst_armed` cleared:
-  - **Recurring** items whose cron fires **later today** reset to dormant so a fresh cycle starts at that cron time (normal `now + offset` expire). Items whose cron **already fired earlier today** (e.g. a 6 AM daily, briefing at 7:30) are activated immediately with their expire time **pinned to exactly 11 PM today**, and the next cron fire (tomorrow) is queued — so they appear on today's list instead of being skipped
+**Overnight rollover + missed recap** (`scheduler.py: _rollover_missed`, inside `fire_morning_briefing`):
+- At the morning briefing, items whose expire time was before the start of today and which weren't completed are **carried forward**:
+  - **Recurring** items whose cron fires **later today** reset to dormant so a fresh cycle starts at that cron time (normal `now + offset` expire). Items whose cron **already fired earlier today** (e.g. a 6 AM daily, briefing at 7:30) are activated immediately with their expire time **pinned to exactly 11 PM today** and `next_nag_at=now` so the Zeno cadence resumes (`roll_recurring_to_next_cycle`) — so they appear on today's list instead of being skipped
   - **One-shots** have `deadline_at` re-dated to today 11 PM (stay active)
-- A 3-message **MISSED burst** naming the carried items is enqueued onto the same pending-burst queue alongside the briefing
+- A single **MISSED recap** SMS naming the carried items is sent alongside the briefing
 
 **Context-aware surfacing** (`app/context_engine.py`):
 - The user texts plain location/intent ("heading to Target", "home for the night") → parsed as the `context_update` intent → stored in `app_state` under `user_context`
-- `evaluate_context(db)` asks GPT (`openai_client.py: select_relevant_items`) which open today-list items fit the moment (time of day + context + task type) and sends a focused digest of those items. Runs **only when the user sends a `context_update` SMS** (not on a timer)
+- `evaluate_context(db)` asks GPT (`openai_client.py: select_relevant_items`) which open today-list items fit the moment (time of day + context + task type) and **pulls them forward** by setting `next_nag_at=now`, so `fire_due_nags` nags them on the next tick. Runs **only when the user sends a `context_update` SMS** (not on a timer)
 
 **Quiet hours** (all outbound nags):
-- No digests or burst messages sent between `QUIET_HOURS_START` (default 0 = midnight) and `QUIET_HOURS_END` (default 6 = 6 AM) local time
-- Digests are held (no reschedule) and the pending-burst queue is held until quiet hours end
+- No nags sent between `QUIET_HOURS_START` (default 0 = midnight) and `QUIET_HOURS_END` (default 6 = 6 AM) local time
+- A due item's `next_nag_at` is deferred to `QUIET_HOURS_END` rather than firing during the window
 
 **Completion-anchored nags** (`anchor_to_completion=True`):
 - Next cycle starts relative to when user marks DONE, not the cron schedule
 - Uses `cycle_months` or `cycle_days` + `_next_nag_cycle()` with `relativedelta`
 
 **Gmail-sourced nags** (`source="gmail"`):
-- Created by `gmail_sync.py` with `repeating=False` (nag indefinitely until done — surfaces in digests with an 11 PM expire time)
+- Created by `gmail_sync.py` with `repeating=False` (nag indefinitely until done — Zeno cadence toward an 11 PM expire time, then 30-min overdue pings)
 - `source_ref` stores the email reference string for dedup
 - `ProcessedEmail` table tracks Gmail Message-ID headers to prevent re-analyzing emails on restart
 
@@ -132,14 +125,11 @@ Twilio POST → /sms
 ## Scheduler Loop (`app/scheduler.py: main()`)
 
 Each tick (60s):
-1. `fire_morning_briefing()` — once/day at BRIEFING_TIME; runs `_rollover_missed()` first and enqueues the MISSED burst
+1. `fire_morning_briefing()` — once/day at BRIEFING_TIME; runs `_rollover_missed()` first and sends the single MISSED recap SMS
 2. `fire_calendar_import()` — once/day at CALENDAR_IMPORT_TIME (8am), add today's calendar events to the list
 3. `fire_due_flashes()` — trigger any scheduled light flashes whose time has passed
-5. `fire_cycle_starts()` — activate dormant nags whose `next_nag_at` has arrived
-6. `fire_due_bursts()` — arm the T−3 due burst for items within 3 min of their expire time
-7. `fire_overdue_pings()` — ping every `OVERDUE_PING_GAP` min for items past their expire time, until done/snoozed
-8. `fire_digests()` — send a random-cadence whole-list digest when `next_digest_at` passes
-9. `drain_burst()` — send ≤1 queued burst message per minute (held during quiet hours)
+4. `fire_cycle_starts()` — activate dormant nags whose `next_nag_at` has arrived (sets `next_nag_at=now` so the first nag fires this tick)
+5. `fire_due_nags()` — Zeno cadence: send one (coalesced) nag per global gate window for active items whose `next_nag_at` has arrived, then advance each by its Zeno interval (30-min flat once overdue)
 
 (`evaluate_context()` is **not** on the tick — it runs only when the user sends a `context_update` SMS, via `_handle_context_update`.)
 
@@ -182,7 +172,7 @@ On startup: sends recovery notification SMS, runs column migrations.
 
 All config is via environment variables with sensible defaults. Credentials fall back to reading from files in `/home/iray/`.
 
-Key settings: `DATABASE_URL`, `OPENAI_API_KEY`, `TWILIO_*`, `USER_PHONE`, `USER_TIMEZONE`, `TICK_SECONDS`, `GMAIL_*`, `WEATHERAPI_KEY`, `BRIEFING_TIME`, `BASEMENT_LIGHT_ON/OFF`, `QUIET_HOURS_START`, `QUIET_HOURS_END`, `DIGEST_MIN_GAP`/`DIGEST_MAX_GAP` (random gap in minutes between list digests, default 45/120), `OVERDUE_PING_GAP` (fixed gap in minutes between overdue pings, default 5), `CALENDAR_IMPORT_TIME` (daily time to import calendar events, default 08:00). (`DEFAULT_MIN_INTERVAL`, `DEFAULT_MAX_INTERVAL`, `GLOBAL_NAG_MIN_GAP`, and `EXERCISE_*_TIME` remain in config but are unused by the digest+burst model.)
+Key settings: `DATABASE_URL`, `OPENAI_API_KEY`, `TWILIO_*`, `USER_PHONE`, `USER_TIMEZONE`, `TICK_SECONDS`, `GMAIL_*`, `WEATHERAPI_KEY`, `BRIEFING_TIME`, `BASEMENT_LIGHT_ON/OFF`, `QUIET_HOURS_START`, `QUIET_HOURS_END`, `DEFAULT_MIN_INTERVAL` (Zeno cadence floor in minutes, default 5), `GLOBAL_NAG_MIN_GAP` (min minutes between any two nag SMS, default 5), `OVERDUE_PING_GAP` (flat gap in minutes between pings once an item is overdue, default 30), `CALENDAR_IMPORT_TIME` (daily time to import calendar events, default 08:00). (`DEFAULT_MAX_INTERVAL`, `DIGEST_MIN_GAP`/`DIGEST_MAX_GAP`, and `EXERCISE_*_TIME` remain in config but are unused by the Zeno model.)
 
 ## Development Notes
 

@@ -123,32 +123,33 @@ def _next_nag_cycle(nag, completion_time: datetime = None) -> datetime:
 
 def roll_recurring_to_next_cycle(nag, now: datetime) -> None:
     """Reset a recurring nag off its current (stale/overdue) cycle onto its next
-    legitimate one, clearing burst/nag/snooze counters. If its cron fires later
-    today it goes dormant so a fresh cycle starts then; if its cron already fired
-    earlier today it's activated now with the expire time pinned to 11 PM today
-    and tomorrow's fire queued. Shared by the overnight rollover
-    (`scheduler._rollover_missed`) and the manual "yesterday ... done" close-out
-    so both behave identically. Does not commit."""
+    legitimate one, clearing nag/snooze counters. If its cron fires later today
+    it goes dormant so a fresh cycle starts then; if its cron already fired
+    earlier today (next fire is tomorrow) it's activated now with the expire time
+    pinned to 11 PM today and the Zeno cadence resuming immediately. Shared by the
+    overnight rollover (`scheduler._rollover_missed`) and the manual
+    "yesterday ... done" close-out so both behave identically. Does not commit."""
     from zoneinfo import ZoneInfo
     tz = ZoneInfo(nag.timezone or USER_TIMEZONE)
     nag.nag_count = 0
     nag.snooze_count = 0
     nag.burst_armed = False
-    cron_passed_today = False
-    if nag.next_nag_at <= now:
-        next_fire = _next_cron_fire(nag.cron_expression, nag.timezone)
-        cron_passed_today = next_fire.astimezone(tz).date() > now.astimezone(tz).date()
-    else:
-        next_fire = nag.next_nag_at
-    if cron_passed_today:
-        eod = now.astimezone(tz).replace(hour=23, minute=0, second=0, microsecond=0)
-        nag.active_since = now
-        nag.deadline_at = eod.astimezone(timezone.utc)
-        nag.next_nag_at = next_fire
-    else:
+    # next_nag_at is the Zeno send clock while active, so recompute the next cron
+    # fire from scratch rather than reading it.
+    next_fire = _next_cron_fire(nag.cron_expression, nag.timezone)
+    cron_fires_today = next_fire.astimezone(tz).date() == now.astimezone(tz).date()
+    if cron_fires_today:
+        # A fresh cycle starts later today — go dormant until then.
         nag.active_since = None
         nag.deadline_at = None
         nag.next_nag_at = next_fire
+    else:
+        # Today's cron already fired (next is tomorrow): carry active onto today,
+        # expire pinned to 11 PM, and nag now via the Zeno cadence.
+        eod = now.astimezone(tz).replace(hour=23, minute=0, second=0, microsecond=0)
+        nag.active_since = now
+        nag.deadline_at = eod.astimezone(timezone.utc)
+        nag.next_nag_at = now
 
 
 _ACK_STOP_WORDS = frozenset({

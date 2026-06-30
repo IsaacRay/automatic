@@ -66,18 +66,19 @@ GOOGLE_CALENDAR_ICS = os.environ.get(
 # Quiet hours — no nags sent during this window (local time)
 QUIET_HOURS_START = int(os.environ.get("QUIET_HOURS_START", "0"))   # midnight
 QUIET_HOURS_END = int(os.environ.get("QUIET_HOURS_END", "6"))       # 6 AM
+# Zeno cadence floor: the smallest gap (minutes) between successive nags for one
+# item as it accelerates toward its expire time. DEFAULT_MAX_INTERVAL is unused.
 DEFAULT_MIN_INTERVAL = int(os.environ.get("DEFAULT_MIN_INTERVAL", "5"))
 DEFAULT_MAX_INTERVAL = int(os.environ.get("DEFAULT_MAX_INTERVAL", "1440"))
 # Global floor between any two outbound nag SMS (minutes). At most one nag SMS
 # per this window; items due in the same window coalesce into a single message.
 GLOBAL_NAG_MIN_GAP = int(os.environ.get("GLOBAL_NAG_MIN_GAP", "5"))
-# Random gap (minutes) between daytime list digests — the bot picks a fresh
-# random value in this range after each digest.
+# Once an item's expire time passes, the Zeno cadence stops accelerating and the
+# item simply pings at this fixed interval (minutes) until checked off or snoozed.
+OVERDUE_PING_GAP = int(os.environ.get("OVERDUE_PING_GAP", "30"))
+# Legacy digest-cadence knobs (unused by the Zeno model; kept for compatibility).
 DIGEST_MIN_GAP = int(os.environ.get("DIGEST_MIN_GAP", "45"))
 DIGEST_MAX_GAP = int(os.environ.get("DIGEST_MAX_GAP", "120"))
-# Once an item's expire time passes (after its due burst), it keeps pinging at
-# this fixed interval (minutes) until checked off or snoozed.
-OVERDUE_PING_GAP = int(os.environ.get("OVERDUE_PING_GAP", "5"))
 
 # Basement light webhooks (IFTTT)
 BASEMENT_LIGHT_ON = os.environ.get("BASEMENT_LIGHT_ON", "")
