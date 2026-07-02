@@ -145,11 +145,14 @@ def _compute_deadline_interval(nag, now):
     deadline_at, so nags accelerate as the deadline nears (with jitter rather
     than a fixed curve), clamped to the item's min_interval_minutes or the global
     DEFAULT_MIN_INTERVAL floor. Once the deadline has passed, acceleration stops
-    and the item simply pings every OVERDUE_PING_GAP minutes until done/snoozed.
-    No deadline → flat min interval."""
+    and the item pings every OVERDUE_PING_GAP to 1.5×OVERDUE_PING_GAP minutes
+    until done/snoozed. No deadline → flat min interval."""
     min_iv = nag.min_interval_minutes or DEFAULT_MIN_INTERVAL
     if nag.deadline_at and now >= nag.deadline_at:
-        return OVERDUE_PING_GAP
+        # Jittered: items overdue at the same moment advance by different
+        # amounts, so they drift apart and nag individually instead of locking
+        # into a permanent combined every-30-min list (reads like a digest).
+        return OVERDUE_PING_GAP + random.randint(0, OVERDUE_PING_GAP // 2)
     if not nag.deadline_at:
         return min_iv
     remaining_minutes = (nag.deadline_at - now).total_seconds() / 60.0
@@ -202,7 +205,7 @@ def fire_due_nags(db):
     For every active item whose next_nag_at has arrived: prepare it (skip if
     checked off, defer if quiet hours), then — subject to the global rate gate —
     send one (possibly coalesced) nag SMS and advance each item's next_nag_at by
-    its Zeno interval (accelerating toward the expire time, or a flat
+    its Zeno interval (accelerating toward the expire time, or a jittered
     OVERDUE_PING_GAP once overdue)."""
     from app.context_engine import is_done_today
     now = datetime.now(timezone.utc)

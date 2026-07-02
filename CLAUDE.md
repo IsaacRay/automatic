@@ -1,6 +1,6 @@
 # ADHD SMS Bot
 
-SMS-based personal assistant for ADHD management. Everything is a **nag** on a single **today list**: you capture items (with `.. `), each gets an **expire time**, and you're reminded on a **Zeno's-paradox cadence** — per-item nags that accelerate as each item's expire time approaches — then, once an item is overdue, a steady ping every 30 minutes until it's done. Also handles Gmail action-item extraction, scheduled basement-light flashes, and morning briefings. Built with FastAPI, PostgreSQL, Twilio, OpenAI GPT-4o, and Gmail IMAP.
+SMS-based personal assistant for ADHD management. Everything is a **nag** on a single **today list**: you capture items (with `.. `), each gets an **expire time**, and you're reminded on a **Zeno's-paradox cadence** — per-item nags that accelerate as each item's expire time approaches — then, once an item is overdue, a jittered ping every 30–45 minutes until it's done. Also handles Gmail action-item extraction, scheduled basement-light flashes, and morning briefings. Built with FastAPI, PostgreSQL, Twilio, OpenAI GPT-4o, and Gmail IMAP.
 
 > Reminders and exercise tracking were removed — the system is nags-only. The `Reminder`/`ExerciseLog` models and their intents no longer exist; their tables linger as legacy.
 
@@ -36,7 +36,7 @@ time, marks it `done`, and sends a short confirmation SMS. This is the only surv
 of the old reminder/event-pair light-flash behavior.
 
 ### Nags (`app/models.py: NagSchedule`)
-Nags are the unified model for both user-created nags and Gmail-extracted action items. Each item has an **expire time** (`deadline_at`) and nags itself on a **Zeno's-paradox cadence**: each successive nag waits a random 25–50% of the time remaining until the expire time, so reminders accelerate (with jitter) as the deadline nears, then flatten to a fixed every-30-minutes ping once overdue.
+Nags are the unified model for both user-created nags and Gmail-extracted action items. Each item has an **expire time** (`deadline_at`) and nags itself on a **Zeno's-paradox cadence**: each successive nag waits a random 25–50% of the time remaining until the expire time, so reminders accelerate (with jitter) as the deadline nears, then flatten to a jittered every-30–45-minutes ping once overdue.
 
 **Timing concepts:**
 - **Expire time** (`deadline_at`): when the item is "due." For one-shots, defaults to 11 PM; for recurring, computed each cycle as the cron start + `deadline_offset_minutes`.
@@ -50,10 +50,10 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
 
 **Zeno cadence** (`scheduler.py: fire_due_nags`, `_compute_deadline_interval`):
 - Every tick, `fire_due_nags` selects active items whose `next_nag_at` has arrived, sends one nag per item (a rich GPT-written deadline message via `openai_client.generate_deadline_nag_message`, plain fallback), and advances each `next_nag_at` by its Zeno interval
-- **Interval** (`_compute_deadline_interval`): before the expire time, a random 25–50% of the remaining minutes (accelerating, jittered), clamped to the item's `min_interval_minutes` or the global `DEFAULT_MIN_INTERVAL` floor (5 min). At/after the expire time it returns a flat `OVERDUE_PING_GAP` (default **30 min**) — the steady overdue ping. No deadline → flat min interval
+- **Interval** (`_compute_deadline_interval`): before the expire time, a random 25–50% of the remaining minutes (accelerating, jittered), clamped to the item's `min_interval_minutes` or the global `DEFAULT_MIN_INTERVAL` floor (5 min). At/after the expire time it returns `OVERDUE_PING_GAP` plus a random 0–50% jitter (default **30–45 min**) — the overdue ping; the jitter makes simultaneously-overdue items drift apart so they nag individually instead of locking into one combined every-30-min list SMS (which reads like the retired digest). No deadline → flat min interval
 - **Coalescing + global gate**: items due in the same tick are merged into one numbered SMS (`_combined_nag_message`, with a GPT `generate_nag_plan` line); a single item gets `_single_nag_message`. At most one nag SMS per `GLOBAL_NAG_MIN_GAP` minutes (default 5) across all items, tracked in `app_state` under `last_nag_sent_at`
 - **Quiet hours**: a due item's `next_nag_at` is deferred to `QUIET_HOURS_END` rather than firing
-- An overdue item keeps pinging every 30 min until **checked off** (`completed_at` set) or **snoozed** (snooze pushes `deadline_at` and `next_nag_at` forward). Items still open at the day boundary are handled by the morning rollover, not by overnight pinging (quiet hours covers the gap)
+- An overdue item keeps pinging every 30–45 min until **checked off** (`completed_at` set) or **snoozed** (snooze pushes `deadline_at` and `next_nag_at` forward). Items still open at the day boundary are handled by the morning rollover, not by overnight pinging (quiet hours covers the gap)
 - **Holds during quiet hours** without advancing (resumes at `QUIET_HOURS_END`); the morning rollover then carries anything still-open from the prior day
 
 **Overnight rollover + missed recap** (`scheduler.py: _rollover_missed`, inside `fire_morning_briefing`):
@@ -75,7 +75,7 @@ Nags are the unified model for both user-created nags and Gmail-extracted action
 - Uses `cycle_months` or `cycle_days` + `_next_nag_cycle()` with `relativedelta`
 
 **Gmail-sourced nags** (`source="gmail"`):
-- Created by `gmail_sync.py` with `repeating=False` (nag indefinitely until done — Zeno cadence toward an 11 PM expire time, then 30-min overdue pings)
+- Created by `gmail_sync.py` with `repeating=False` (nag indefinitely until done — Zeno cadence toward an 11 PM expire time, then 30–45-min overdue pings)
 - `source_ref` stores the email reference string for dedup
 - `ProcessedEmail` table tracks Gmail Message-ID headers to prevent re-analyzing emails on restart
 
@@ -129,7 +129,7 @@ Each tick (60s):
 2. `fire_calendar_import()` — once/day at CALENDAR_IMPORT_TIME (8am), add today's calendar events to the list
 3. `fire_due_flashes()` — trigger any scheduled light flashes whose time has passed
 4. `fire_cycle_starts()` — activate dormant nags whose `next_nag_at` has arrived (sets `next_nag_at=now` so the first nag fires this tick)
-5. `fire_due_nags()` — Zeno cadence: send one (coalesced) nag per global gate window for active items whose `next_nag_at` has arrived, then advance each by its Zeno interval (30-min flat once overdue)
+5. `fire_due_nags()` — Zeno cadence: send one (coalesced) nag per global gate window for active items whose `next_nag_at` has arrived, then advance each by its Zeno interval (jittered 30–45 min once overdue)
 
 (`evaluate_context()` is **not** on the tick — it runs only when the user sends a `context_update` SMS, via `_handle_context_update`.)
 
@@ -172,7 +172,7 @@ On startup: sends recovery notification SMS, runs column migrations.
 
 All config is via environment variables with sensible defaults. Credentials fall back to reading from files in `/home/iray/`.
 
-Key settings: `DATABASE_URL`, `OPENAI_API_KEY`, `TWILIO_*`, `USER_PHONE`, `USER_TIMEZONE`, `TICK_SECONDS`, `GMAIL_*`, `WEATHERAPI_KEY`, `BRIEFING_TIME`, `BASEMENT_LIGHT_ON/OFF`, `QUIET_HOURS_START`, `QUIET_HOURS_END`, `DEFAULT_MIN_INTERVAL` (Zeno cadence floor in minutes, default 5), `GLOBAL_NAG_MIN_GAP` (min minutes between any two nag SMS, default 5), `OVERDUE_PING_GAP` (flat gap in minutes between pings once an item is overdue, default 30), `CALENDAR_IMPORT_TIME` (daily time to import calendar events, default 08:00). (`DEFAULT_MAX_INTERVAL`, `DIGEST_MIN_GAP`/`DIGEST_MAX_GAP`, and `EXERCISE_*_TIME` remain in config but are unused by the Zeno model.)
+Key settings: `DATABASE_URL`, `OPENAI_API_KEY`, `TWILIO_*`, `USER_PHONE`, `USER_TIMEZONE`, `TICK_SECONDS`, `GMAIL_*`, `WEATHERAPI_KEY`, `BRIEFING_TIME`, `BASEMENT_LIGHT_ON/OFF`, `QUIET_HOURS_START`, `QUIET_HOURS_END`, `DEFAULT_MIN_INTERVAL` (Zeno cadence floor in minutes, default 5), `GLOBAL_NAG_MIN_GAP` (min minutes between any two nag SMS, default 5), `OVERDUE_PING_GAP` (base gap in minutes between pings once an item is overdue, default 30; each ping adds a random 0–50% jitter), `CALENDAR_IMPORT_TIME` (daily time to import calendar events, default 08:00). (`DEFAULT_MAX_INTERVAL`, `DIGEST_MIN_GAP`/`DIGEST_MAX_GAP`, and `EXERCISE_*_TIME` remain in config but are unused by the Zeno model.)
 
 ## Development Notes
 
